@@ -1,0 +1,476 @@
+#Requires -Version 5.1
+
+<#
+.SYNOPSIS
+    Provisions a least-privilege, TPM-bound certificate credential for the Proaxiom
+    Phase 1 Entra ID discovery app registration.
+
+.DESCRIPTION
+    Thin entry point for the entraid-discovery-app tool. It selects one of two
+    provisioning shapes by parameter set and dispatches to the KeyGeneration module:
+
+      GenerateLocal (default)
+        Generates a new RSA-2048 signing key inside the Microsoft Platform Crypto
+        Provider (TPM), proves the private key is non-exportable, and exports only
+        the public certificate (.cer) for upload to Entra. Fails closed if no
+        usable TPM / Platform Crypto Provider is present.
+
+      ImportCert
+        Accepts a supplied public certificate (.cer / PEM / base64) that was
+        generated elsewhere, and produces its metadata. Generates no key.
+
+    This script is intentionally a thin dispatcher: all behaviour lives in
+    src/Common.psm1 and src/KeyGeneration.psm1. App-registration creation and TPM
+    attestation are layered on in later tasks (see the insertion point below).
+
+.PARAMETER GenerateLocal
+    Selects the GenerateLocal parameter set: generate a TPM-bound key on this
+    endpoint. This is the default mode.
+
+.PARAMETER Subject
+    Certificate subject distinguished name. Default: 'CN=Proaxiom Discovery App'.
+    (GenerateLocal only.)
+
+.PARAMETER ValidityMonths
+    Certificate validity in months (1-120). Default: 24. (GenerateLocal only.)
+
+.PARAMETER PublicCertPath
+    Optional path to write the exported public certificate (.cer). When omitted a
+    default location is used. (GenerateLocal only.)
+
+.PARAMETER CertPath
+    Path to a supplied public certificate to import (.cer / PEM / base64). Selects
+    the ImportCert parameter set.
+
+.PARAMETER StoreLocation
+    Certificate store location: 'LocalMachine' (default) or 'CurrentUser'.
+
+.PARAMETER Force
+    Overwrite an existing exported certificate file.
+
+.PARAMETER ForceNewApp
+    Idempotency override (FR 20). By default -CreateAppRegistration refuses to create
+    a new application when one of the same -DisplayName already exists in the tenant,
+    throwing with the existing app's id and the ways forward (attach with -AppObjectId,
+    pick a new -DisplayName, use -TestNaming, or pass -ForceNewApp). -ForceNewApp
+    creates a deliberate duplicate instead.
+
+.EXAMPLE
+    ./New-ProaxiomDiscoveryApp.ps1
+
+    Generates a TPM-bound key with the default subject and 24-month validity in
+    LocalMachine\My, and exports the public certificate.
+
+.EXAMPLE
+    ./New-ProaxiomDiscoveryApp.ps1 -GenerateLocal -Subject 'CN=Acme Discovery' -ValidityMonths 12 -PublicCertPath C:\temp\acme.cer -Force
+
+    Generates a TPM-bound key with a custom subject and 12-month validity and writes
+    the public certificate to the given path, overwriting if it exists.
+
+.EXAMPLE
+    ./New-ProaxiomDiscoveryApp.ps1 -CertPath C:\temp\supplied.cer
+
+    Imports a public certificate generated elsewhere and reports its metadata.
+#>
+
+[CmdletBinding(DefaultParameterSetName = 'GenerateLocal', SupportsShouldProcess = $true)]
+param(
+    # --- GenerateLocal parameter set ---
+    [Parameter(ParameterSetName = 'GenerateLocal')]
+    [switch]$GenerateLocal,
+
+    [Parameter(ParameterSetName = 'GenerateLocal')]
+    [ValidateNotNullOrEmpty()]
+    [string]$Subject = 'CN=Proaxiom Discovery App',
+
+    [Parameter(ParameterSetName = 'GenerateLocal')]
+    [ValidateRange(1, 120)]
+    [int]$ValidityMonths = 24,
+
+    [Parameter(ParameterSetName = 'GenerateLocal')]
+    [string]$PublicCertPath,
+
+    # --- ImportCert parameter set ---
+    [Parameter(ParameterSetName = 'ImportCert', Mandatory)]
+    [ValidateNotNullOrEmpty()]
+    [string]$CertPath,
+
+    # --- Shared parameters ---
+    [ValidateSet('LocalMachine', 'CurrentUser')]
+    [string]$StoreLocation = 'LocalMachine',
+
+    [switch]$Force,
+
+    # --- App registration (Task 3.0, FR 12-15) ---
+
+    # Create a NEW application + service principal with the trimmed manifest,
+    # embedding the public cert as a keyCredential at creation (FR 12). Usable
+    # after generating (GenerateLocal) or importing (ImportCert) a cert.
+    [switch]$CreateAppRegistration,
+
+    # Attach the public cert to an EXISTING app registration (object id) (FR 13).
+    # Mutually exclusive with -CreateAppRegistration.
+    [ValidateNotNullOrEmpty()]
+    [string]$AppObjectId,
+
+    # Grant tenant-wide admin consent (app-role assignments on the SP) (FR 14).
+    # OPT-IN: without it, portal consent instructions are printed instead.
+    [switch]$GrantConsent,
+
+    # Application display name for -CreateAppRegistration. Defaults to the
+    # production name; -TestNaming overrides with zzTEST-DiscoveryApp-<timestamp>.
+    [ValidateNotNullOrEmpty()]
+    [string]$DisplayName,
+
+    # Use the integration-tier 'zzTEST-DiscoveryApp-<timestamp>' naming (Task 3.5).
+    [switch]$TestNaming,
+
+    # Idempotency override (FR 20). By default -CreateAppRegistration refuses to
+    # create an app when one of the same -DisplayName already exists in the tenant
+    # (it throws, naming the existing app and the ways forward). -ForceNewApp creates
+    # a DELIBERATE duplicate anyway. Shared across both parameter sets.
+    [switch]$ForceNewApp,
+
+    # Tenant id to connect to for the app-registration operations (optional).
+    [ValidateNotNullOrEmpty()]
+    [string]$TenantId,
+
+    # --- Cross-user access (Task 4.0, FR 16) ---
+
+    # Grant a non-admin operator account Read access to the LocalMachine key's
+    # private-key ACL so it can sign without being a local admin (FR 16). Operates
+    # on the key produced/targeted in this run. CurrentUser keys warn + no-op.
+    [ValidateNotNullOrEmpty()]
+    [string]$GrantUser,
+
+    # Target an EXISTING key (by certificate thumbprint) for -GrantUser instead of
+    # one generated/imported this run. Useful when ACLing a previously-provisioned
+    # LocalMachine key.
+    [ValidateNotNullOrEmpty()]
+    [string]$GrantUserThumbprint,
+
+    # --- Attestation (Task 5.0, FR 17-19) ---
+
+    # Produce (GenerateLocal) or verify (ImportCert) a TPM key-attestation bundle.
+    # In GenerateLocal it creates a CNG key-attestation claim over the new TPM key
+    # plus EK material and an honest assurance summary. In ImportCert it verifies a
+    # supplied bundle (NCryptVerifyClaim). Valid in BOTH parameter sets.
+    [switch]$Attest,
+
+    # Where to WRITE the attestation bundle (GenerateLocal) or READ it (ImportCert).
+    # Defaults to "<thumbprint>.attestation.json" beside the public cert when omitted
+    # (GenerateLocal); required content for verification (ImportCert).
+    [ValidateNotNullOrEmpty()]
+    [string]$AttestationPath,
+
+    # Opt-in: hard-fail when the TPM Endorsement Key does NOT chain to a manufacturer
+    # root (no EK certificate — e.g. a vTPM). Default behaviour reports + warns
+    # WITHOUT hard-failing (Open Question #1 resolution). FR 19 is honoured either way.
+    [switch]$RequireHardwareRoot
+)
+
+Set-StrictMode -Version Latest
+$ErrorActionPreference = 'Stop'
+
+Import-Module "$PSScriptRoot/src/Common.psm1" -Force
+Import-Module "$PSScriptRoot/src/KeyGeneration.psm1" -Force
+Import-Module "$PSScriptRoot/src/Manifest.psm1" -Force
+Import-Module "$PSScriptRoot/src/AppRegistration.psm1" -Force
+Import-Module "$PSScriptRoot/src/CrossUser.psm1" -Force
+Import-Module "$PSScriptRoot/src/Output.psm1" -Force
+Import-Module "$PSScriptRoot/src/Attestation.psm1" -Force
+
+# -CreateAppRegistration and -AppObjectId are mutually exclusive app-registration
+# targets (create-new vs attach-to-existing). Guard before any tenant contact.
+if ($CreateAppRegistration -and -not [string]::IsNullOrWhiteSpace($AppObjectId)) {
+    throw 'Specify either -CreateAppRegistration (new app) or -AppObjectId (existing app), not both.'
+}
+if ($GrantConsent -and -not $CreateAppRegistration) {
+    throw '-GrantConsent applies to -CreateAppRegistration (it grants consent on the newly created service principal).'
+}
+
+$meta = $null
+
+switch ($PSCmdlet.ParameterSetName) {
+
+    'GenerateLocal' {
+        # 1. Gate: fail closed if no usable TPM / Platform Crypto Provider (FR 8).
+        $providerStatus = Test-PlatformCryptoProvider
+        if (-not $providerStatus.Available) {
+            throw "No usable TPM / Microsoft Platform Crypto Provider available: $($providerStatus.Reason)"
+        }
+
+        # 1b. Idempotency notice (FR 20): warn (do NOT block or delete) if the target
+        #     store already holds a non-expired certificate with the same subject. A
+        #     new key is generated alongside it (legitimate signing-key rotation). The
+        #     pure matcher is Tier-A testable without touching a real store.
+        $existingStorePath = "Cert:\$StoreLocation\My"
+        if (Test-Path -LiteralPath $existingStorePath) {
+            $storeCerts = @(Get-ChildItem -LiteralPath $existingStorePath -ErrorAction SilentlyContinue)
+            $sameSubject = @(Get-DiscoveryExistingKeyMatch -Certificate $storeCerts -Subject $Subject)
+            if ($sameSubject.Count -gt 0) {
+                Write-Warning ("Idempotency: $($sameSubject.Count) existing non-expired certificate(s) with subject " +
+                               "'$Subject' already in $existingStorePath. A new key will be generated ALONGSIDE them " +
+                               '(signing-key rotation); none are deleted or reused:')
+                foreach ($c in $sameSubject) {
+                    Write-Warning ("  - Thumbprint {0}  (NotAfter {1:yyyy-MM-dd})" -f $c.Thumbprint, $c.NotAfter)
+                }
+            }
+        }
+
+        # 2. Generate the TPM-bound, non-exportable key (FR 7).
+        #    New-DiscoveryTpmKey returns METADATA (a PSCustomObject with .Thumbprint
+        #    etc.), NOT an [X509Certificate2]. The downstream calls below all need the
+        #    live certificate object, so fetch it back out of the store by thumbprint
+        #    (mirroring the Tier-B tests). $certificate stays $null under -WhatIf,
+        #    where no key was actually created; the guards below handle that.
+        $certificate = $null
+        if ($PSCmdlet.ShouldProcess("$StoreLocation\My", "Generate TPM-bound key for '$Subject'")) {
+            $keyResult = New-DiscoveryTpmKey -Subject $Subject -ValidityMonths $ValidityMonths -StoreLocation $StoreLocation
+
+            $certPath = "Cert:\{0}\My\{1}" -f $StoreLocation, $keyResult.Thumbprint
+            if (-not (Test-Path -LiteralPath $certPath)) {
+                throw "Generated key not found in the store at '$certPath' (thumbprint '$($keyResult.Thumbprint)'). Refusing to continue."
+            }
+            $certificate = Get-Item -LiteralPath $certPath
+        }
+
+        # 3. Assert non-exportability (FR 7). Skip under -WhatIf (no key generated).
+        if ($null -ne $certificate) {
+            $nonExport = Assert-KeyNonExportable -Certificate $certificate
+            if (-not $nonExport.NonExportable) {
+                throw "Generated key is exportable; refusing to continue (provider: $($nonExport.ProviderName))."
+            }
+        }
+
+        # 4. Export only the public certificate (FR 10). Capture the path so the
+        #    app-registration step can embed it as a keyCredential.
+        $exportedCertPath = $null
+        if ($null -ne $certificate -and $PSCmdlet.ShouldProcess($PublicCertPath, 'Export public certificate (.cer)')) {
+            $export = Export-DiscoveryPublicCertificate -Certificate $certificate -Path $PublicCertPath -Force:$Force
+            $exportedCertPath = $export.Path
+        }
+
+        # 5. Collect metadata for output. Use the live cert when present; under
+        #    -WhatIf (no key) fall back to a null metadata object so downstream
+        #    formatting/handling is skipped cleanly.
+        if ($null -ne $certificate) {
+            $meta = Get-DiscoveryCertMetadata -Certificate $certificate
+        }
+    }
+
+    'ImportCert' {
+        # 1. Import the supplied public certificate; no key generation (FR 11).
+        #    Import-DiscoveryPublicCertificate returns METADATA (it validates the
+        #    file is a public cert and emits Get-DiscoveryCertMetadata output), NOT
+        #    an [X509Certificate2]. Use that metadata directly for output, and load
+        #    the real certificate object from the supplied file for any downstream
+        #    -Certificate consumer (e.g. attestation verify does not use it; the
+        #    cross-user grant below requires a private key the public .cer lacks and
+        #    is handled separately via -GrantUserThumbprint).
+        $meta = Import-DiscoveryPublicCertificate -Path $CertPath
+
+        # The live public certificate object (the file was already validated above),
+        # for any consumer that takes an [X509Certificate2] rather than metadata.
+        # The constructor reads DER/PEM .cer files directly. A raw-base64 text file
+        # (also accepted by Import-DiscoveryPublicCertificate) is not loadable this
+        # way; leave $certificate $null in that case — the only ImportCert consumer
+        # of $certificate is the cross-user grant, which requires a private key the
+        # public cert never has and is driven via -GrantUserThumbprint instead.
+        $certificate = $null
+        try {
+            $certificate = [System.Security.Cryptography.X509Certificates.X509Certificate2]::new($CertPath)
+        }
+        catch {
+            $certificate = $null
+        }
+
+        # The supplied .cer is the public cert to embed in the app registration.
+        $exportedCertPath = $CertPath
+    }
+}
+
+# --- Common result handling ---
+# $meta is $null only under -WhatIf in GenerateLocal (no key was generated); in
+# every executed path it is populated. Guard so -WhatIf does not trip ValidateNotNull.
+if ($null -ne $meta) {
+    Format-DiscoveryKeyResult -Metadata $meta
+}
+
+# --- App registration (Task 3.0, FR 12-15) ----------------------------------
+# Only runs when the operator opts in via -CreateAppRegistration or -AppObjectId.
+# Each tenant-mutating call honours ShouldProcess (so -WhatIf performs no write).
+$appResult = $null
+
+if ($CreateAppRegistration -or -not [string]::IsNullOrWhiteSpace($AppObjectId)) {
+
+    if ([string]::IsNullOrWhiteSpace($exportedCertPath)) {
+        throw 'No public certificate is available to register (cert export was skipped, e.g. under -WhatIf).'
+    }
+
+    # The provisioner authenticates delegated/interactively with the required scopes.
+    Connect-DiscoveryGraph -TenantId $TenantId
+
+    if ($CreateAppRegistration) {
+        $name = New-DiscoveryAppDisplayName -Test:$TestNaming
+        if (-not [string]::IsNullOrWhiteSpace($DisplayName)) {
+            $name = $DisplayName
+        }
+
+        # -ForceNewApp flows into the wrapper's idempotency guard (FR 20): without it,
+        # an existing same-name app causes New-DiscoveryAppRegistration to throw rather
+        # than silently creating a duplicate.
+        $appResult = New-DiscoveryAppRegistration -DisplayName $name -CertPath $exportedCertPath -Force:$ForceNewApp
+
+        # Admin consent is OPT-IN (FR 14): only granted with -GrantConsent.
+        if ($GrantConsent) {
+            if ($null -ne $appResult.ServicePrincipalId) {
+                $consent = Grant-DiscoveryAdminConsent -ServicePrincipalId $appResult.ServicePrincipalId
+                $appResult | Add-Member -NotePropertyName 'ConsentGranted' -NotePropertyValue $true -Force
+                $appResult | Add-Member -NotePropertyName 'ConsentGrantedCount' -NotePropertyValue $consent.Granted -Force
+            }
+        }
+    }
+    else {
+        # Attach the public cert to an existing app registration (FR 13).
+        $appResult = Add-DiscoveryAppCredential -AppObjectId $AppObjectId -CertPath $exportedCertPath
+    }
+
+    if ($null -ne $appResult) {
+        Format-DiscoveryAppResult -Result $appResult
+    }
+}
+
+# --- Cross-user access (Task 4.0, FR 16) ------------------------------------
+# Only runs when the operator opts in via -GrantUser. Grants the account Read
+# access to the LocalMachine key's private-key ACL; CurrentUser keys warn + no-op.
+# The ShouldProcess on Grant-DiscoveryKeyAccess means -WhatIf performs no write.
+$grantResult = $null
+
+if (-not [string]::IsNullOrWhiteSpace($GrantUser)) {
+
+    # Resolve the certificate to ACL. Prefer an explicit -GrantUserThumbprint
+    # (target a previously-provisioned key); otherwise use the cert from this run.
+    $grantCert = $null
+    if (-not [string]::IsNullOrWhiteSpace($GrantUserThumbprint)) {
+        $grantCertPath = "Cert:\$StoreLocation\My\$GrantUserThumbprint"
+        if (-not (Test-Path -LiteralPath $grantCertPath)) {
+            throw "No certificate with thumbprint '$GrantUserThumbprint' found in $StoreLocation\My for -GrantUser."
+        }
+        $grantCert = Get-Item -LiteralPath $grantCertPath
+    }
+    elseif ($null -ne $certificate) {
+        $grantCert = $certificate
+    }
+    else {
+        throw 'No certificate is available for -GrantUser (key generation/import was skipped, e.g. under -WhatIf). Use -GrantUserThumbprint to target an existing key.'
+    }
+
+    $grantResult = Grant-DiscoveryKeyAccess -Certificate $grantCert `
+        -Account $GrantUser -StoreLocation $StoreLocation
+}
+
+# --- Attestation (Task 5.0, FR 17-19) ---------------------------------------
+# Only runs when the operator opts in via -Attest.
+#   GenerateLocal -> produce a TPM key-attestation bundle for the new key (FR 17).
+#   ImportCert    -> verify a supplied bundle (FR 18).
+# FR 19 honesty is enforced in src/Attestation.psm1: a vTPM with no EK certificate
+# reports EkChainedToManufacturerRoot = $false and a NOT-hardware-rooted assurance.
+# -RequireHardwareRoot is opt-in hard-fail; default is report + warn.
+$attestResult = $null
+
+if ($Attest) {
+
+    # Attestation requires Windows + a TPM. Fail closed with a clear message off-host.
+    if (-not (Test-IsWindows)) {
+        throw 'Attestation (-Attest) is Windows-only: TPM key attestation requires Windows and a TPM (Microsoft Platform Crypto Provider).'
+    }
+
+    if ($PSCmdlet.ParameterSetName -eq 'GenerateLocal') {
+
+        if ($null -eq $certificate) {
+            throw 'No generated key is available to attest (key generation was skipped, e.g. under -WhatIf).'
+        }
+
+        # Build the TPM key-attestation bundle (claim + EK material + assurance).
+        $attestResult = New-DiscoveryAttestation -Certificate $certificate
+
+        # Resolve the bundle output path (default beside the cert / thumbprint).
+        $bundlePath = $AttestationPath
+        if ([string]::IsNullOrWhiteSpace($bundlePath)) {
+            $baseDir = if (-not [string]::IsNullOrWhiteSpace($exportedCertPath)) {
+                Split-Path -Parent $exportedCertPath
+            }
+            else {
+                (Get-Location).Path
+            }
+            if ([string]::IsNullOrWhiteSpace($baseDir)) { $baseDir = (Get-Location).Path }
+            $bundlePath = Join-Path $baseDir ("{0}.attestation.json" -f $attestResult.Thumbprint)
+        }
+
+        # Write the bundle (ShouldProcess-gated so -WhatIf performs no write).
+        if ($PSCmdlet.ShouldProcess($bundlePath, 'Write TPM attestation bundle')) {
+            Set-Content -LiteralPath $bundlePath -Value $attestResult.Json -Encoding UTF8
+            $attestResult | Add-Member -NotePropertyName 'BundlePath' -NotePropertyValue $bundlePath -Force
+        }
+
+        # Enforce -RequireHardwareRoot (opt-in hard-fail) vs default report + warn.
+        $enforce = Test-RequireHardwareRoot `
+            -RequireHardwareRoot:$RequireHardwareRoot `
+            -EkChainedToManufacturerRoot ([bool]$attestResult.EkChainedToManufacturerRoot)
+        if ($enforce.ShouldFail) {
+            throw $enforce.Reason
+        }
+        if (-not [bool]$attestResult.EkChainedToManufacturerRoot) {
+            Write-Warning ('Attestation: {0}' -f $attestResult.Rationale)
+        }
+
+        Write-Host ''
+        Write-Host 'TPM attestation bundle' -ForegroundColor Green
+        Write-Host '----------------------'
+        Write-Host ("  Assurance        : {0}" -f $attestResult.AssuranceLevel)
+        Write-Host ("  Hardware root    : {0}" -f $attestResult.EkChainedToManufacturerRoot)
+        Write-Host ("  Bundle path      : {0}" -f $(if ($attestResult.PSObject.Properties.Name -contains 'BundlePath') { $attestResult.BundlePath } else { '(not written; -WhatIf)' }))
+        Write-Host ''
+    }
+    else {
+        # ImportCert: verify a supplied bundle (FR 18).
+        if ([string]::IsNullOrWhiteSpace($AttestationPath)) {
+            throw '-Attest in ImportCert mode requires -AttestationPath (the bundle to verify).'
+        }
+
+        $attestResult = Test-DiscoveryAttestation -Path $AttestationPath
+
+        # -RequireHardwareRoot also gates verification: refuse to bless a non-hw-root bundle.
+        $enforce = Test-RequireHardwareRoot `
+            -RequireHardwareRoot:$RequireHardwareRoot `
+            -EkChainedToManufacturerRoot ([bool]$attestResult.EkChainedToManufacturerRoot)
+        if ($enforce.ShouldFail) {
+            throw $enforce.Reason
+        }
+        if (-not [bool]$attestResult.EkChainedToManufacturerRoot) {
+            Write-Warning 'Attestation verify: the bundle is NOT hardware-rooted (EK does not chain to a manufacturer root).'
+        }
+
+        Write-Host ''
+        Write-Host 'TPM attestation verification' -ForegroundColor Green
+        Write-Host '----------------------------'
+        Write-Host ("  Verify result    : {0}" -f $attestResult.VerifyResult)
+        Write-Host ("  Assurance        : {0}" -f $attestResult.AssuranceLevel)
+        Write-Host ("  Hardware root    : {0}" -f $attestResult.EkChainedToManufacturerRoot)
+        Write-Host ("  Reason           : {0}" -f $attestResult.Reason)
+        Write-Host ''
+    }
+}
+
+# Emit the structured objects: cert metadata always, app + grant + attest results when present.
+$meta
+if ($null -ne $appResult) {
+    $appResult
+}
+if ($null -ne $grantResult) {
+    $grantResult
+}
+if ($null -ne $attestResult) {
+    $attestResult
+}

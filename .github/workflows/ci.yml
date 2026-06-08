@@ -1,0 +1,106 @@
+name: CI (Tier-A)
+
+# ---------------------------------------------------------------------------
+# Public, GitHub-hosted CI.
+# ---------------------------------------------------------------------------
+# Runs the Pester suite on GitHub-hosted Windows runners only — no private
+# infrastructure, no TPM, no tenant, no secrets. The real-TPM / live-tenant
+# tests (key generation against the Microsoft Platform Crypto Provider, cross-user
+# ACL, attestation, app-registration Graph calls) are capability-gated and
+# auto-SKIP on a hosted runner with no usable TPM. That is expected and fine:
+# this workflow exists to keep the Tier-A logic (parameters, manifest, and the
+# off-TPM paths) green on every push and PR.
+#
+# We run under BOTH PowerShell hosts via a matrix:
+#   * Windows PowerShell 5.1 (Desktop) -> shell: powershell
+#   * PowerShell 7.x        (Core)     -> shell: pwsh
+# so any 5.1-vs-7 behavioural split is caught.
+# ---------------------------------------------------------------------------
+
+on:
+  push:
+  pull_request:
+
+jobs:
+  pester:
+    name: Pester (${{ matrix.ps }})
+    runs-on: windows-latest
+
+    strategy:
+      fail-fast: false
+      matrix:
+        # powershell = Windows PowerShell 5.1, pwsh = PowerShell 7.
+        ps: [powershell, pwsh]
+
+    # Setting the per-host shell once in defaults.run lets every run step use the
+    # matrixed host (the matrix context is not allowed in a step-level shell:).
+    defaults:
+      run:
+        shell: ${{ matrix.ps }}
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Show PowerShell host / version
+        run: |
+          $PSVersionTable | Format-List | Out-String | Write-Host
+          Write-Host "Edition: $($PSVersionTable.PSEdition)  Host: ${{ matrix.ps }}"
+
+      - name: Ensure Pester v5 is available
+        run: |
+          $ErrorActionPreference = 'Stop'
+          $existing = Get-Module -ListAvailable -Name Pester |
+            Where-Object { $_.Version -ge [version]'5.0.0' } |
+            Sort-Object Version -Descending |
+            Select-Object -First 1
+          if ($existing) {
+            Write-Host "Pester $($existing.Version) already available."
+          }
+          else {
+            Write-Host 'Pester v5 not found; installing for CurrentUser.'
+            $pp = Get-PackageProvider -Name NuGet -ListAvailable -ErrorAction SilentlyContinue
+            if (-not $pp) {
+              Install-PackageProvider -Name NuGet -Force -Scope CurrentUser | Out-Null
+            }
+            Install-Module -Name Pester -MinimumVersion 5.0.0 `
+              -Scope CurrentUser -Force -SkipPublisherCheck
+          }
+
+      - name: Run Pester suite (TPM / tenant tests auto-skip on hosted runner)
+        run: |
+          $ErrorActionPreference = 'Stop'
+          Import-Module Pester -MinimumVersion 5.0.0 -Force
+          Write-Host "Using Pester $((Get-Module Pester).Version)"
+
+          $results = Join-Path $PWD 'pester-results'
+          New-Item -ItemType Directory -Path $results -Force | Out-Null
+
+          $cfg = New-PesterConfiguration
+          # Run the whole tests/ directory. On a hosted runner the Tier-B
+          # capability gate evaluates false, so TPM/tenant tests skip rather
+          # than fail.
+          $cfg.Run.Path               = (Join-Path $PWD 'tests')
+          $cfg.Run.PassThru           = $true
+          $cfg.Output.Verbosity       = 'Detailed'
+          $cfg.TestResult.Enabled     = $true
+          $cfg.TestResult.OutputFormat = 'NUnitXml'
+          $cfg.TestResult.OutputPath  = (Join-Path $results "pester-${{ matrix.ps }}.xml")
+
+          $run = Invoke-Pester -Configuration $cfg
+
+          Write-Host ("Passed={0} Failed={1} Skipped={2}" -f `
+            $run.PassedCount, $run.FailedCount, $run.SkippedCount)
+
+          # Fail the job on any test failure.
+          if ($run.FailedCount -gt 0) {
+            throw "$($run.FailedCount) Pester test(s) failed."
+          }
+
+      - name: Upload Pester test results
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: pester-results-${{ matrix.ps }}
+          path: pester-results/pester-${{ matrix.ps }}.xml
+          if-no-files-found: error
