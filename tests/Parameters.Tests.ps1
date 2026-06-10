@@ -32,13 +32,14 @@ BeforeDiscovery {
 
     # ----------------------------------------------------------------------
     # CAPABILITY GATE — evaluated during Pester DISCOVERY so the -Skip:(...)
-    # expression on the 'fails closed off-Windows' Context can read it.
-    # Copied VERBATIM from tests/KeyGeneration.Tests.ps1's BeforeDiscovery so
+    # expression on the 'fails closed when not on a TPM host' Context can read
+    # it. Copied VERBATIM from tests/KeyGeneration.Tests.ps1's BeforeDiscovery so
     # both files gate identically: on a real Windows + TPM host the MPCP opens
-    # via CNG ($OnTpmHost = $true) and the off-Windows fail-closed assertions
-    # (Available=$false / Reason '*Windows*') would be INVERTED, so we skip them
-    # there. Off a TPM host (e.g. macOS) this short-circuits to $false and the
-    # fail-closed Context runs.
+    # via CNG ($OnTpmHost = $true) and the fail-closed assertions
+    # (Available=$false / a Reason naming the missing capability) would be
+    # INVERTED, so we skip them there. Anywhere else — macOS/non-Windows OR
+    # Windows WITHOUT a usable TPM (GitHub-hosted windows-latest) — this
+    # evaluates to $false and the fail-closed Context runs.
     # ----------------------------------------------------------------------
     $isWin = if ($PSVersionTable.PSEdition -eq 'Desktop') { $true } else { [bool]$IsWindows }
 
@@ -123,10 +124,12 @@ Describe 'New-ProaxiomDiscoveryApp.ps1 parameter surface' {
 
     Context 'GenerateLocal-only parameters are absent from the ImportCert set' {
 
+        # NOTE: -PublicCertPath used to be GenerateLocal-bound but is SHARED since
+        # Task 8.4 (the ImportPrivateKey pathway also exports a public cert); its
+        # cross-set membership is asserted in the credential-mode Describe below.
         It '<param> is in GenerateLocal but not ImportCert' -ForEach @(
             @{ param = 'Subject' }
             @{ param = 'ValidityMonths' }
-            @{ param = 'PublicCertPath' }
         ) {
             $sets = @(Get-ParamSetNames -ParameterName $param | Sort-Object -Unique)
             $sets | Should -Contain 'GenerateLocal' -Because "$param is a GenerateLocal parameter"
@@ -326,18 +329,22 @@ Describe 'KeyGeneration.psm1 off-Windows behaviour' {
     }
 
     # Skip-gated on a real TPM host: there the provider IS available
-    # (Available=$true, Reason='OK'), which would invert these off-Windows
-    # fail-closed assertions. Runs only OFF a TPM host (e.g. macOS dev box).
-    Context 'Test-PlatformCryptoProvider fails closed off-Windows' -Skip:($script:OnTpmHost) {
+    # (Available=$true, Reason='OK'), which would invert these fail-closed
+    # assertions. Runs everywhere else: macOS/non-Windows (Reason 'Not a
+    # Windows host') AND Windows WITHOUT a usable TPM, e.g. the GitHub-hosted
+    # windows-latest runner (Reason 'TPM not present' / 'TPM present but not
+    # ready' / MPCP not listed / MPCP failed to open via CNG).
+    Context 'Test-PlatformCryptoProvider fails closed when not on a TPM host' -Skip:($script:OnTpmHost) {
 
         It 'reports Available = $false' {
             $status = Test-PlatformCryptoProvider
             $status.Available | Should -BeFalse -Because 'no TPM/MPCP off-Windows -> fail closed'
         }
 
-        It 'gives a Reason mentioning Windows' {
+        It 'gives a fail-closed Reason naming the missing capability' {
             $status = Test-PlatformCryptoProvider
-            $status.Reason | Should -BeLike '*Windows*'
+            $status.Reason | Should -Match 'Windows|TPM|Platform Crypto' `
+                -Because 'every fail-closed path names the missing capability (host OS, TPM, or MPCP) and the success Reason OK matches none of these'
         }
     }
 
@@ -429,6 +436,233 @@ Describe 'KeyGeneration.psm1 off-Windows behaviour' {
             $x5t = $script:Meta.X5tBase64Url
             $x5t      | Should -Not -BeNullOrEmpty
             $x5t      | Should -Not -Match '[+/=]' -Because 'x5t must be base64url without padding'
+        }
+    }
+}
+
+Describe 'CredentialMode parameter surface and guards (Task 8.4)' {
+
+    BeforeDiscovery {
+        # The fail-closed acknowledgement assertion may only run when the session
+        # CANNOT prompt (stdin redirected, as in CI and scripted runs): on a real
+        # interactive console the script would pose a ShouldContinue prompt
+        # instead of throwing, hanging the test run. Skip it there.
+        $script:AckPromptPossible = $false
+        try {
+            $script:AckPromptPossible = -not [System.Console]::IsInputRedirected
+        }
+        catch {
+            $script:AckPromptPossible = $false
+        }
+    }
+
+    BeforeAll {
+        $script:ScriptPath =
+            (Resolve-Path -LiteralPath (Join-Path (Join-Path $PSScriptRoot '..') 'New-ProaxiomDiscoveryApp.ps1')).Path
+
+        # Get-Command parses the script and exposes parameter metadata WITHOUT
+        # executing the body -- safe off-Windows.
+        $script:Cmd        = Get-Command -Name $script:ScriptPath
+        $script:Parameters = $script:Cmd.Parameters
+
+        # Helper: which parameter sets a given parameter participates in.
+        function Get-CmParamSetNames {
+            param([string]$ParameterName)
+            $script:Parameters[$ParameterName].Attributes |
+                Where-Object { $_ -is [System.Management.Automation.ParameterAttribute] } |
+                ForEach-Object { $_.ParameterSetName }
+        }
+
+        # --- Build a throwaway PUBLIC certificate (.cer, DER) via openssl ---
+        # (Same fixture pattern as the off-Windows Describe above; that Describe's
+        # AfterAll removes ITS fixture, so this one builds its own.)
+        $script:TmpDir = Join-Path ([System.IO.Path]::GetTempPath()) ("proaxiom-tier-a-cm-" + [guid]::NewGuid())
+        New-Item -ItemType Directory -Path $script:TmpDir -Force | Out-Null
+
+        $keyPath = Join-Path $script:TmpDir 'key.pem'
+        $pemPath = Join-Path $script:TmpDir 'cert.pem'
+        $script:CmCerPath = Join-Path $script:TmpDir 'cert.cer'
+
+        # openssl writes key-gen progress to stderr; under Windows PowerShell 5.1
+        # with $ErrorActionPreference = 'Stop' that raises a terminating
+        # NativeCommandError even with 2>$null. Scope a LOCAL 'Continue' here.
+        $ErrorActionPreference = 'Continue'
+
+        & openssl req -x509 -newkey rsa:2048 -nodes `
+            -keyout $keyPath -out $pemPath -days 30 `
+            -subj '/CN=Proaxiom CredentialMode Fixture' 2>$null
+        if ($LASTEXITCODE -ne 0) { throw "openssl req failed (exit $LASTEXITCODE)" }
+
+        & openssl x509 -in $pemPath -outform DER -out $script:CmCerPath 2>$null
+        if ($LASTEXITCODE -ne 0) { throw "openssl x509 (DER) failed (exit $LASTEXITCODE)" }
+    }
+
+    AfterAll {
+        if ($script:TmpDir -and (Test-Path -LiteralPath $script:TmpDir)) {
+            Remove-Item -LiteralPath $script:TmpDir -Recurse -Force -ErrorAction SilentlyContinue
+        }
+    }
+
+    Context 'Parameter surface' {
+
+        It '-CredentialMode exists with exactly the five pathway values in assurance order' {
+            $script:Parameters.ContainsKey('CredentialMode') | Should -BeTrue
+            $vs = $script:Parameters['CredentialMode'].Attributes |
+                Where-Object { $_ -is [System.Management.Automation.ValidateSetAttribute] } |
+                Select-Object -First 1
+            $vs | Should -Not -BeNullOrEmpty -Because '-CredentialMode must carry a ValidateSet'
+            @($vs.ValidValues) | Should -Be @(
+                'TpmBound', 'ProviderHostedCert', 'ImportPublicCert', 'ImportPrivateKey', 'ClientSecret'
+            ) -Because 'the ValidateSet order IS the assurance order (rank 1..5)'
+        }
+
+        It '-CredentialMode defaults to TpmBound (and the script parses clean)' {
+            $tokens = $null
+            $parseErrors = $null
+            $ast = [System.Management.Automation.Language.Parser]::ParseFile(
+                $script:ScriptPath, [ref]$tokens, [ref]$parseErrors)
+            @($parseErrors).Count | Should -Be 0 -Because 'the entry script must parse without errors'
+            $param = @($ast.ParamBlock.Parameters |
+                Where-Object { $_.Name.VariablePath.UserPath -eq 'CredentialMode' })
+            $param.Count | Should -Be 1
+            $param[0].DefaultValue.Extent.Text | Should -Be "'TpmBound'" `
+                -Because 'TpmBound is the default (and highest-assurance) pathway'
+        }
+
+        It '-PfxPath is a string with ValidateNotNullOrEmpty' {
+            $script:Parameters['PfxPath'].ParameterType | Should -Be ([string])
+            $vne = $script:Parameters['PfxPath'].Attributes |
+                Where-Object { $_ -is [System.Management.Automation.ValidateNotNullOrEmptyAttribute] } |
+                Select-Object -First 1
+            $vne | Should -Not -BeNullOrEmpty -Because '-PfxPath must reject empty input'
+        }
+
+        It '-PfxPassword is a SecureString' {
+            $script:Parameters.ContainsKey('PfxPassword') | Should -BeTrue
+            $script:Parameters['PfxPassword'].ParameterType | Should -Be ([securestring]) `
+                -Because 'the PFX password must never be accepted as plain text'
+        }
+
+        It '-AcknowledgeReducedAssurance is a switch' {
+            $script:Parameters.ContainsKey('AcknowledgeReducedAssurance') | Should -BeTrue
+            $script:Parameters['AcknowledgeReducedAssurance'].ParameterType | Should -Be ([switch])
+        }
+
+        It '<param> is shared across both parameter sets (cross-set)' -ForEach @(
+            @{ param = 'CredentialMode' }
+            @{ param = 'PfxPath' }
+            @{ param = 'PfxPassword' }
+            @{ param = 'AcknowledgeReducedAssurance' }
+            @{ param = 'PublicCertPath' }
+        ) {
+            $sets = @(Get-CmParamSetNames -ParameterName $param)
+            $sets | Should -Contain '__AllParameterSets' `
+                -Because "$param must be usable from GenerateLocal and ImportCert invocations"
+        }
+    }
+
+    Context 'Credential-mode consistency guards (fire before any TPM/Graph/file work)' {
+
+        # Each guard throws from pure parameter checks at the top of the script:
+        # no TPM probe, no Graph/SDK import, no tenant contact, no file access --
+        # which is what makes them assertable on any OS. -WhatIf is belt-and-braces.
+
+        It 'rejects ImportPublicCert without -CertPath' {
+            { & $script:ScriptPath -CredentialMode ImportPublicCert -WhatIf -ErrorAction Stop } |
+                Should -Throw -ExpectedMessage '*ImportPublicCert requires -CertPath*'
+        }
+
+        It 'rejects ProviderHostedCert without -CertPath' {
+            { & $script:ScriptPath -CredentialMode ProviderHostedCert -WhatIf -ErrorAction Stop } |
+                Should -Throw -ExpectedMessage '*ProviderHostedCert requires -CertPath*'
+        }
+
+        It 'rejects ImportPrivateKey without -PfxPath' {
+            { & $script:ScriptPath -CredentialMode ImportPrivateKey -AcknowledgeReducedAssurance -WhatIf -ErrorAction Stop } |
+                Should -Throw -ExpectedMessage '*ImportPrivateKey requires -PfxPath*'
+        }
+
+        It 'rejects -PfxPath with an explicit non-ImportPrivateKey mode (TpmBound)' {
+            { & $script:ScriptPath -CredentialMode TpmBound -PfxPath 'supplied.pfx' -WhatIf -ErrorAction Stop } |
+                Should -Throw -ExpectedMessage '*applies only to the ImportPrivateKey pathway*'
+        }
+
+        It 'rejects -CertPath and -PfxPath together' {
+            { & $script:ScriptPath -CertPath 'a.cer' -PfxPath 'b.pfx' -WhatIf -ErrorAction Stop } |
+                Should -Throw -ExpectedMessage '*not both*'
+        }
+
+        It 'rejects ClientSecret with -CertPath' {
+            { & $script:ScriptPath -CredentialMode ClientSecret -CertPath 'a.cer' -AcknowledgeReducedAssurance -WhatIf -ErrorAction Stop } |
+                Should -Throw -ExpectedMessage '*ClientSecret uses no certificate*'
+        }
+
+        It 'rejects ClientSecret with -Attest' {
+            { & $script:ScriptPath -CredentialMode ClientSecret -CreateAppRegistration -Attest -AcknowledgeReducedAssurance -WhatIf -ErrorAction Stop } |
+                Should -Throw -ExpectedMessage '*no key to attest*'
+        }
+
+        It 'rejects ClientSecret without -CreateAppRegistration or -AppObjectId' {
+            { & $script:ScriptPath -CredentialMode ClientSecret -AcknowledgeReducedAssurance -WhatIf -ErrorAction Stop } |
+                Should -Throw -ExpectedMessage '*requires an app-registration target*'
+        }
+
+        It 'rejects -Attest in ImportPrivateKey mode' {
+            { & $script:ScriptPath -CredentialMode ImportPrivateKey -PfxPath 'supplied.pfx' -Attest -AcknowledgeReducedAssurance -WhatIf -ErrorAction Stop } |
+                Should -Throw -ExpectedMessage '*not valid with -CredentialMode ImportPrivateKey*'
+        }
+    }
+
+    Context 'Back-compatible mode inference' {
+
+        It 'a plain -CertPath run still takes the ImportPublicCert pathway (no throw, metadata out)' {
+            $out = @(& $script:ScriptPath -CertPath $script:CmCerPath -WhatIf -ErrorAction Stop 6>$null)
+            $out.Count | Should -BeGreaterThan 0
+            $out[0].Thumbprint    | Should -Not -BeNullOrEmpty
+            $out[0].Subject       | Should -Match 'Proaxiom CredentialMode Fixture'
+            $out[0].HasPrivateKey | Should -BeFalse
+        }
+
+        It 'an explicit -CredentialMode ImportPublicCert -CertPath run is equivalent' {
+            $implicit = @(& $script:ScriptPath -CertPath $script:CmCerPath -WhatIf -ErrorAction Stop 6>$null)
+            $explicit = @(& $script:ScriptPath -CredentialMode ImportPublicCert -CertPath $script:CmCerPath -WhatIf -ErrorAction Stop 6>$null)
+            $explicit.Count | Should -BeGreaterThan 0
+            $explicit[0].Thumbprint | Should -BeExactly $implicit[0].Thumbprint
+        }
+    }
+
+    Context 'Reduced-assurance acknowledgement gate' {
+
+        It 'ClientSecret without -AcknowledgeReducedAssurance fails closed (non-interactive), naming the flag' -Skip:($script:AckPromptPossible) {
+            { & $script:ScriptPath -CredentialMode ClientSecret -CreateAppRegistration -WhatIf -ErrorAction Stop 6>$null } |
+                Should -Throw -ExpectedMessage '*-AcknowledgeReducedAssurance*'
+        }
+
+        It 'ClientSecret with -AcknowledgeReducedAssurance proceeds past the gate' {
+            # Past the gate the run may legitimately stop later (e.g. the Graph
+            # SDK assert on a machine without the SDK); assert only that any
+            # failure is NOT the acknowledgement gate.
+            $err = $null
+            try {
+                $null = & $script:ScriptPath -CredentialMode ClientSecret -CreateAppRegistration `
+                    -AcknowledgeReducedAssurance -WhatIf -ErrorAction Stop 6>$null 3>$null
+            }
+            catch {
+                $err = $_
+            }
+            if ($null -ne $err) {
+                $err.Exception.Message | Should -Not -Match '(?i)acknowledg' `
+                    -Because 'the acknowledgement gate must be satisfied by the flag'
+            }
+        }
+    }
+
+    Context 'Posture disclosure' {
+
+        It 'prints the credential-pathway posture block (information stream)' {
+            $captured = & $script:ScriptPath -CertPath $script:CmCerPath -WhatIf -ErrorAction Stop 6>&1
+            ($captured | Out-String) | Should -Match 'Credential pathway' `
+                -Because 'every run must disclose the selected pathway posture before provisioning'
         }
     }
 }

@@ -15,6 +15,85 @@ performed by you, in your tenant, on your own screen. Nothing is consented autom
 
 ---
 
+## Choosing a credential pathway
+
+The stages below describe the **default and recommended** pathway — `TpmBound`, where the
+private key is generated non-exportable inside the provisioning workstation's TPM. The tool
+also supports four alternative credential pathways, selected with `-CredentialMode`, for
+engagements where on-endpoint key generation is not possible. Ranked by assurance:
+
+| Mode | Assurance rank | Where the private key lives | Acknowledgement |
+|------|----------------|-----------------------------|-----------------|
+| `TpmBound` (default) | 1 — highest | This machine's TPM (non-exportable) | Not required |
+| `ProviderHostedCert` | 2 — high | A TPM on a Proaxiom-operated Azure VM (Proaxiom retains custody) | Not required (custody disclosed) |
+| `ImportPublicCert` | 3 — holder-dependent | Wherever you keep it — the tool never sees it | Not required |
+| `ImportPrivateKey` | 4 — reduced | A PFX file that travelled between parties | **Required** |
+| `ClientSecret` | 5 — lowest | No key — a bearer secret string | **Required** |
+
+Every run prints the selected pathway's **security posture before anything is written to
+your tenant**. The two reduced-assurance modes additionally require an explicit
+acknowledgement — an interactive Y/N prompt, or `-AcknowledgeReducedAssurance` when
+scripted — and **fail closed** without it. Full per-mode detail (mechanics, downsides,
+when to choose each, handover hygiene) is in
+[`docs/reference/credential-modes.md`](reference/credential-modes.md).
+
+Only the **credential stage** changes between modes: the selected mode's credential source
+replaces Stage 1 (and supplies the certificate — or secret — carried into Stage 2). App
+creation, the admin-consent flow (Stage 3), verification, and decommission are identical in
+every mode — the consent moment stays with your administrator regardless of pathway. The
+TPM prerequisite applies to `TpmBound` only.
+
+### Alternate-pathway invocations
+
+**`ProviderHostedCert`** — Proaxiom supplies the public certificate (the key is held
+TPM-bound on a Proaxiom-operated Azure VM) and, optionally, a TPM attestation bundle the
+tool can verify:
+
+```powershell
+./New-ProaxiomDiscoveryApp.ps1 -CredentialMode ProviderHostedCert `
+  -CertPath .\proaxiom-provided.cer -AttestationPath .\bundle.json `
+  -CreateAppRegistration -DisplayName '<your app name>'
+```
+
+**`ImportPrivateKey`** — you supply a PFX/P12; the password is prompted as a SecureString
+(or passed with `-PfxPassword` when scripted). The store copy is installed non-exportable
+into `LocalMachine\My`, but the source PFX file remains an exposure — delete every copy
+after import. Acknowledgement required:
+
+```powershell
+./New-ProaxiomDiscoveryApp.ps1 -CredentialMode ImportPrivateKey -PfxPath .\supplied.pfx `
+  -CreateAppRegistration -DisplayName '<your app name>'
+# prints the posture block, then prompts for acknowledgement (Y/N);
+# scripted runs add -AcknowledgeReducedAssurance instead of the prompt
+```
+
+**`ClientSecret`** — no certificate; a generated secret is added to the app and printed
+**once**. Acknowledgement required:
+
+```powershell
+./New-ProaxiomDiscoveryApp.ps1 -CredentialMode ClientSecret `
+  -CreateAppRegistration -DisplayName '<your app name>'
+```
+
+The once-printed output looks conceptually like:
+
+```
+Client secret created (displayed ONCE — the tool does not store it)
+--------------------------------------------------------------------
+  SecretId : <key id>
+  Expires  : <end date>
+  Value    : <secret value — copy it now; it cannot be shown again>
+
+Share the value via Proaxiom Pass (https://pass.proaxiom.com) as a one-time,
+short-expiry link. Never email or message the raw value. For a PFX handover,
+send the file and its password as two SEPARATE one-time links.
+```
+
+The tool never writes the secret value to a file. Keep reduced-assurance credentials
+short-lived and rotate them.
+
+---
+
 ## Who does what, and where
 
 There are **two actors** and **two hosts**:

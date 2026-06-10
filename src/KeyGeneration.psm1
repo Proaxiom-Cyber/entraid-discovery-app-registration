@@ -12,6 +12,8 @@
       * Assert-KeyNonExportable           - prove the private key cannot be exported (FR 7)
       * Export-DiscoveryPublicCertificate - write the public .cer only (FR 10)
       * Import-DiscoveryPublicCertificate - accept a supplied public cert (FR 11)
+      * Import-DiscoveryPfx               - install a supplied PFX (cert + PRIVATE key)
+                                            into a store (ImportPrivateKey pathway)
       * Get-DiscoveryCertMetadata         - normalised metadata for downstream use
       * Format-DiscoveryKeyResult         - human-readable summary
 
@@ -609,6 +611,148 @@ function Import-DiscoveryPublicCertificate {
     Get-DiscoveryCertMetadata -Certificate $cert
 }
 
+function Import-DiscoveryPfx {
+    <#
+    .SYNOPSIS
+        Installs a supplied PFX/PKCS#12 bundle (certificate + PRIVATE key) into a
+        Windows certificate store (ImportPrivateKey pathway).
+
+    .DESCRIPTION
+        Loads a .pfx/.p12 file and installs it into the personal ('My') store at
+        the chosen location, persisting the private key (PersistKeySet) bound to
+        the machine or user key set to match the store. The store copy is
+        deliberately installed WITHOUT the Exportable flag, so the installed
+        private key cannot simply be re-exported from the certificate store
+        (a small hardening).
+
+        IMPORTANT -- that hardening does not change the fundamental posture of
+        this pathway: the SOURCE .pfx file remains a portable copy of the private
+        key. The caller should consider securely deleting the source PFX (and any
+        other copies) after a successful import; the ImportPrivateKey
+        credential-posture disclosure covers this exposure.
+
+        Fails closed off-Windows: installing a private key into a Windows
+        certificate store requires Windows.
+
+    .PARAMETER Path
+        Path to the .pfx / .p12 file. Required.
+
+    .PARAMETER Password
+        The PFX password as a SecureString. Optional (omit for a password-less
+        PFX). A wrong or missing password surfaces as a clear, actionable error.
+
+    .PARAMETER StoreLocation
+        Certificate store location: 'LocalMachine' (default; writing requires an
+        elevated session) or 'CurrentUser'.
+
+    .OUTPUTS
+        PSCustomObject (certificate metadata from Get-DiscoveryCertMetadata, with
+        StorePath = Cert:\<location>\My\<thumbprint> and ImportedFromPfx = $true).
+    #>
+    [CmdletBinding()]
+    [OutputType([pscustomobject])]
+    param(
+        [Parameter(Mandatory)]
+        [ValidateNotNullOrEmpty()]
+        [string]$Path,
+
+        [Parameter()]
+        [AllowNull()]
+        [securestring]$Password,
+
+        [Parameter()]
+        [ValidateSet('LocalMachine', 'CurrentUser')]
+        [string]$StoreLocation = 'LocalMachine'
+    )
+
+    if (-not (Test-IsWindows)) {
+        throw ('Import-DiscoveryPfx requires Windows: installing a private key into a Windows ' +
+               'certificate store is only possible on a Windows host.')
+    }
+
+    if (-not (Test-Path -LiteralPath $Path)) {
+        throw "PFX file not found: '$Path'."
+    }
+
+    # Key-storage flags: persist the key, bound to the key set that matches the
+    # destination store. Deliberately NOT Exportable -- the installed store copy
+    # is marked non-exportable (see .DESCRIPTION; the source PFX file remains the
+    # real exposure).
+    $flags = [System.Security.Cryptography.X509Certificates.X509KeyStorageFlags]::PersistKeySet
+    if ($StoreLocation -eq 'LocalMachine') {
+        $flags = $flags -bor [System.Security.Cryptography.X509Certificates.X509KeyStorageFlags]::MachineKeySet
+    }
+    else {
+        $flags = $flags -bor [System.Security.Cryptography.X509Certificates.X509KeyStorageFlags]::UserKeySet
+    }
+
+    $cert = $null
+    try {
+        if ($null -ne $Password) {
+            $cert = [System.Security.Cryptography.X509Certificates.X509Certificate2]::new($Path, $Password, $flags)
+        }
+        else {
+            # [NullString]::Value passes a true null STRING, deterministically
+            # selecting the (string, string, flags) constructor overload on both
+            # PowerShell 5.1 and 7 (a bare $null is ambiguous between the string
+            # and SecureString password overloads).
+            $cert = [System.Security.Cryptography.X509Certificates.X509Certificate2]::new(
+                $Path, [NullString]::Value, $flags)
+        }
+    }
+    catch {
+        # Most commonly a wrong/missing password (CryptographicException, e.g.
+        # "The specified network password is not correct."); also raised for a
+        # corrupt or non-PKCS#12 file. Rethrow with actionable context. NEVER
+        # echo the supplied password value.
+        throw ("Could not load '$Path' as a PFX/PKCS#12 bundle. The most common cause is a wrong or " +
+               'missing -Password; also confirm the file really is a .pfx/.p12. Underlying error: ' +
+               $_.Exception.Message)
+    }
+
+    if (-not $cert.HasPrivateKey) {
+        throw ("'$Path' loaded but carries no private key -- it is not a usable PFX bundle. " +
+               'For a PUBLIC certificate use the ImportPublicCert pathway (-CertPath) instead.')
+    }
+
+    # Install into the personal store at the chosen location. Explicit enum
+    # arguments keep the X509Store constructor overload resolution deterministic
+    # across PowerShell 5.1 and 7.
+    $storeLocationEnum = [System.Security.Cryptography.X509Certificates.StoreLocation]$StoreLocation
+    $store = [System.Security.Cryptography.X509Certificates.X509Store]::new(
+        [System.Security.Cryptography.X509Certificates.StoreName]::My, $storeLocationEnum)
+    try {
+        $store.Open([System.Security.Cryptography.X509Certificates.OpenFlags]::ReadWrite)
+        $store.Add($cert)
+    }
+    catch {
+        $hint = ''
+        if ($StoreLocation -eq 'LocalMachine') {
+            $hint = (' Writing to the LocalMachine store requires elevation -- re-run as Administrator, ' +
+                     'or use -StoreLocation CurrentUser.')
+        }
+        throw ("Could not install the certificate into Cert:\$StoreLocation\My (access denied?)." + $hint +
+               ' Underlying error: ' + $_.Exception.Message)
+    }
+    finally {
+        $store.Close()
+    }
+
+    # Read the installed copy back out of the store (proves the install landed);
+    # fall back to the in-memory object if the store read fails for any reason.
+    $storePath = "Cert:\$StoreLocation\My\$($cert.Thumbprint)"
+    $installed = $null
+    try { $installed = Get-Item -LiteralPath $storePath -ErrorAction Stop } catch { $installed = $cert }
+
+    $metadata = Get-DiscoveryCertMetadata -Certificate $installed
+    # StorePath here is the FULL item path (including the thumbprint), unlike the
+    # container-only StorePath Get-DiscoveryCertMetadata reports, so downstream
+    # callers can Get-Item it directly. -Force overwrites the existing property.
+    $metadata | Add-Member -NotePropertyName 'StorePath'       -NotePropertyValue $storePath -Force
+    $metadata | Add-Member -NotePropertyName 'ImportedFromPfx' -NotePropertyValue $true      -Force
+    $metadata
+}
+
 function Get-DiscoveryCertMetadata {
     <#
     .SYNOPSIS
@@ -755,5 +899,6 @@ Export-ModuleMember -Function `
     Assert-KeyNonExportable, `
     Export-DiscoveryPublicCertificate, `
     Import-DiscoveryPublicCertificate, `
+    Import-DiscoveryPfx, `
     Get-DiscoveryCertMetadata, `
     Format-DiscoveryKeyResult

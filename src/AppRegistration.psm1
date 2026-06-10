@@ -10,13 +10,18 @@
 
     Pure builders:
       * New-DiscoveryKeyCredential         - keyCredential from a public .cer (FR 12)
-      * New-DiscoveryAppPayload            - full New-MgApplication body (FR 12)
+      * New-DiscoveryAppPayload            - full New-MgApplication body (FR 12);
+                                             -NoKeyCredential omits the cert (ClientSecret mode)
+      * New-DiscoveryPasswordCredentialPayload - passwordCredential metadata for a
+                                             client secret (Graph generates the VALUE)
       * New-DiscoveryAppDisplayName        - naming incl. zzTEST-DiscoveryApp-<ts> (3.5)
 
     Graph wrappers (lazy SDK import; honour ShouldProcess via -WhatIf passthrough):
       * Connect-DiscoveryGraph             - ensure connected with required scopes
       * New-DiscoveryAppRegistration       - create app + SP, embed cert (FR 12)
       * Add-DiscoveryAppCredential         - attach cert to an existing app (FR 13)
+      * New-DiscoveryAppClientSecret       - add a Graph-generated client secret
+                                             (ClientSecret mode; SecureString-only result)
       * Grant-DiscoveryAdminConsent        - app-role assignments on the SP (FR 14)
       * Remove-DiscoveryAppRegistration    - teardown app + SP (3.5)
 
@@ -39,6 +44,7 @@
       New-MgApplication                        | New-DiscoveryAppRegistration   | -CreateAppRegistration
       New-MgServicePrincipal                   | New-DiscoveryAppRegistration   | -CreateAppRegistration (post-create)
       Update-MgApplication (add keyCredential) | Add-DiscoveryAppCredential     | -AppObjectId
+      Add-MgApplicationPassword                | New-DiscoveryAppClientSecret   | -CredentialMode ClientSecret (operator-selected)
       New-MgServicePrincipalAppRoleAssignment  | Grant-DiscoveryAdminConsent    | -GrantConsent
       Remove-MgServicePrincipal                | Remove-DiscoveryAppRegistration| (teardown — integration tier only)
       Remove-MgApplication                     | Remove-DiscoveryAppRegistration| (teardown — integration tier only)
@@ -797,13 +803,16 @@ function New-DiscoveryAppPayload {
 
         Pure: no Graph SDK, no tenant. Either a cert -Path / -Certificate (built
         into a keyCredential here) OR a prebuilt -KeyCredential may be supplied.
+        With -NoKeyCredential, no cert input is required and the keyCredentials
+        key is OMITTED from the payload entirely (ClientSecret mode: the secret
+        is added to the created app afterwards via New-DiscoveryAppClientSecret).
 
     .PARAMETER DisplayName
         Application display name. Required.
 
     .PARAMETER CertPath
         Path to the public certificate to embed. One of CertPath/Certificate/
-        KeyCredential is required.
+        KeyCredential is required (unless -NoKeyCredential).
 
     .PARAMETER Certificate
         Preloaded public certificate to embed.
@@ -816,6 +825,11 @@ function New-DiscoveryAppPayload {
 
     .PARAMETER SignInAudience
         signInAudience value. Default 'AzureADMyOrg' (single tenant).
+
+    .PARAMETER NoKeyCredential
+        Build the payload with NO certificate credential: the keyCredentials key
+        is omitted entirely (not set to an empty array) and cert inputs are not
+        consulted. Used by -CredentialMode ClientSecret.
 
     .OUTPUTS
         System.Collections.Hashtable (the New-MgApplication body).
@@ -847,8 +861,23 @@ function New-DiscoveryAppPayload {
 
         [Parameter()]
         [ValidateSet('AzureADMyOrg', 'AzureADMultipleOrgs', 'AzureADandPersonalMicrosoftAccount')]
-        [string]$SignInAudience = 'AzureADMyOrg'
+        [string]$SignInAudience = 'AzureADMyOrg',
+
+        [switch]$NoKeyCredential
     )
+
+    if ($NoKeyCredential) {
+        # No-cert pathway (-CredentialMode ClientSecret): the app is created with
+        # NO certificate credential, so the keyCredentials key is OMITTED ENTIRELY
+        # (not an empty array) and no cert input is required or consulted. The
+        # client secret is added to the created app afterwards
+        # (New-DiscoveryAppClientSecret).
+        return @{
+            displayName            = $DisplayName
+            signInAudience         = $SignInAudience
+            requiredResourceAccess = (Get-DiscoveryRequiredResourceAccess -Path $ManifestPath)
+        }
+    }
 
     # Resolve the keyCredential from whichever input was supplied.
     $keyCred = $null
@@ -872,6 +901,46 @@ function New-DiscoveryAppPayload {
         signInAudience         = $SignInAudience
         requiredResourceAccess = $rra
         keyCredentials         = @($keyCred)
+    }
+}
+
+function New-DiscoveryPasswordCredentialPayload {
+    <#
+    .SYNOPSIS
+        Builds the passwordCredential metadata for a client secret (ClientSecret mode).
+
+    .DESCRIPTION
+        PURE builder (no Graph SDK, no tenant) for the -PasswordCredential body of
+        Add-MgApplicationPassword: only displayName and endDateTime. Microsoft
+        Graph GENERATES the secret VALUE server-side and returns it exactly once
+        in the response -- this payload never carries (and can never carry) a
+        secret value.
+
+    .PARAMETER DisplayName
+        Display name for the secret. Default 'Proaxiom discovery client secret'.
+
+    .PARAMETER ValidityMonths
+        Secret lifetime in months (1-24). Default 6. Deliberately capped well
+        below certificate lifetimes: a bearer secret should be short-lived.
+
+    .OUTPUTS
+        System.Collections.Hashtable (displayName, endDateTime [UTC]).
+    #>
+    [CmdletBinding()]
+    [OutputType([hashtable])]
+    param(
+        [Parameter()]
+        [ValidateNotNullOrEmpty()]
+        [string]$DisplayName = 'Proaxiom discovery client secret',
+
+        [Parameter()]
+        [ValidateRange(1, 24)]
+        [int]$ValidityMonths = 6
+    )
+
+    @{
+        displayName = $DisplayName
+        endDateTime = (Get-Date).ToUniversalTime().AddMonths($ValidityMonths)
     }
 }
 
@@ -967,6 +1036,12 @@ function New-DiscoveryAppRegistration {
     .PARAMETER ManifestPath
         Permission manifest path. Defaults to manifests/permissions.csv.
 
+    .PARAMETER NoKeyCredential
+        Create the application with NO certificate credential (the payload omits
+        keyCredentials entirely); cert inputs are not consulted and the returned
+        Thumbprint is $null. Used by -CredentialMode ClientSecret, where
+        New-DiscoveryAppClientSecret adds a client secret to the created app.
+
     .PARAMETER Force
         Idempotency override (FR 20). By default this wrapper queries the tenant for
         an existing application of the same display name and THROWS (refusing to
@@ -997,6 +1072,8 @@ function New-DiscoveryAppRegistration {
         [AllowEmptyString()]
         [string]$ManifestPath,
 
+        [switch]$NoKeyCredential,
+
         [switch]$Force
     )
 
@@ -1014,16 +1091,23 @@ function New-DiscoveryAppRegistration {
     }
 
     $payloadArgs = @{ DisplayName = $DisplayName; ManifestPath = $ManifestPath }
-    if ($null -ne $Certificate)                       { $payloadArgs['Certificate'] = $Certificate }
+    if ($NoKeyCredential) {
+        # ClientSecret mode: no keyCredential at creation; cert inputs not consulted.
+        $payloadArgs['NoKeyCredential'] = $true
+    }
+    elseif ($null -ne $Certificate)                       { $payloadArgs['Certificate'] = $Certificate }
     elseif (-not [string]::IsNullOrWhiteSpace($CertPath)) { $payloadArgs['CertPath'] = $CertPath }
     $payload = New-DiscoveryAppPayload @payloadArgs
 
+    # No certificate in ClientSecret mode -> Thumbprint stays $null.
     $thumbprint = $null
-    if ($null -ne $Certificate) {
-        $thumbprint = $Certificate.Thumbprint
-    }
-    elseif (-not [string]::IsNullOrWhiteSpace($CertPath)) {
-        try { $thumbprint = ([System.Security.Cryptography.X509Certificates.X509Certificate2]::new($CertPath)).Thumbprint } catch { $thumbprint = $null }
+    if (-not $NoKeyCredential) {
+        if ($null -ne $Certificate) {
+            $thumbprint = $Certificate.Thumbprint
+        }
+        elseif (-not [string]::IsNullOrWhiteSpace($CertPath)) {
+            try { $thumbprint = ([System.Security.Cryptography.X509Certificates.X509Certificate2]::new($CertPath)).Thumbprint } catch { $thumbprint = $null }
+        }
     }
 
     if (-not $PSCmdlet.ShouldProcess($DisplayName, 'Create app registration + service principal')) {
@@ -1143,6 +1227,118 @@ function Add-DiscoveryAppCredential {
     New-DiscoveryResult -Property @{
         AppObjectId = $AppObjectId
         Thumbprint  = $thumbprint
+    }
+}
+
+function New-DiscoveryAppClientSecret {
+    <#
+    .SYNOPSIS
+        Adds a Graph-generated client secret to an existing app registration
+        (-CredentialMode ClientSecret).
+
+    .DESCRIPTION
+        Calls Add-MgApplicationPassword on the target application. Microsoft
+        Graph GENERATES the secret value server-side (it is never chosen
+        client-side) and returns it EXACTLY ONCE in the response.
+
+        SECRET HANDLING (print-once design): the returned plain-text value is
+        converted to a SecureString IMMEDIATELY and surfaced ONLY as the
+        SecretSecure property of the result; the plain-text local and the raw
+        Graph response reference are nulled before returning. No plain-string
+        secret property is ever placed on the returned object, written to a
+        file, or logged by this function. The single authorised display is
+        Format-DiscoveryClientSecretResult (host print-once + Proaxiom Pass
+        handover instructions).
+
+        Honours ShouldProcess: under -WhatIf no tenant write occurs and the
+        result shape is returned with SecretSecure = $null, WhatIf = $true.
+
+        Requires an authenticated session (call Connect-DiscoveryGraph first)
+        with Application.ReadWrite.All.
+
+    .PARAMETER AppObjectId
+        The object id of the application to add the secret to. Required.
+
+    .PARAMETER DisplayName
+        Display name for the secret. Default 'Proaxiom discovery client secret'.
+
+    .PARAMETER ValidityMonths
+        Secret lifetime in months (1-24). Default 6.
+
+    .OUTPUTS
+        PSCustomObject with AppObjectId, KeyId, Hint, DisplayName, StartDateTime,
+        EndDateTime, SecretSecure ([System.Security.SecureString]; $null under
+        -WhatIf, which also adds WhatIf = $true).
+    #>
+    [CmdletBinding(SupportsShouldProcess = $true)]
+    [OutputType([pscustomobject])]
+    param(
+        [Parameter(Mandatory)]
+        [ValidateNotNullOrEmpty()]
+        [string]$AppObjectId,
+
+        [Parameter()]
+        [ValidateNotNullOrEmpty()]
+        [string]$DisplayName = 'Proaxiom discovery client secret',
+
+        [Parameter()]
+        [ValidateRange(1, 24)]
+        [int]$ValidityMonths = 6
+    )
+
+    Assert-GraphModuleAvailable
+
+    $payload = New-DiscoveryPasswordCredentialPayload -DisplayName $DisplayName -ValidityMonths $ValidityMonths
+
+    if (-not $PSCmdlet.ShouldProcess($AppObjectId, "Add client secret '$DisplayName' (valid $ValidityMonths months)")) {
+        return New-DiscoveryResult -Property @{
+            AppObjectId   = $AppObjectId
+            KeyId         = $null
+            Hint          = $null
+            DisplayName   = $DisplayName
+            StartDateTime = $null
+            EndDateTime   = $payload.endDateTime
+            SecretSecure  = $null
+            WhatIf        = $true
+        }
+    }
+
+    # Locals for the retry scriptblock (mirrors the New-DiscoveryAppRegistration
+    # pattern). Adding a password right after app creation can hit the same
+    # replication-lag window as SP creation, hence the bounded retry.
+    $appObjId   = $AppObjectId
+    $pwdPayload = $payload
+    $response = Invoke-DiscoveryGraphWithRetry -OperationName 'client-secret creation' -ScriptBlock {
+        Add-MgApplicationPassword -ApplicationId $appObjId -PasswordCredential $pwdPayload -ErrorAction Stop
+    }
+
+    # SECRET HANDLING: $response.SecretText is the ONLY copy of the generated
+    # value. Convert it to a SecureString immediately, then null the plain-text
+    # local and drop the response reference so no plain-string copy survives
+    # this scope. (The .NET string itself lives until garbage collection --
+    # unavoidable -- but nothing retains a reference to it.)
+    $secretSecure = $null
+    $plain = $response.SecretText
+    if (-not [string]::IsNullOrEmpty($plain)) {
+        $secretSecure = ConvertTo-SecureString -String $plain -AsPlainText -Force
+    }
+    $plain = $null
+
+    $keyId    = $response.KeyId
+    $hint     = $response.Hint
+    $name     = $response.DisplayName
+    $start    = $response.StartDateTime
+    $end      = $response.EndDateTime
+    $response = $null
+
+    New-DiscoveryResult -Property @{
+        AppObjectId   = $AppObjectId
+        KeyId         = $keyId
+        Hint          = $hint
+        DisplayName   = $name
+        StartDateTime = $start
+        EndDateTime   = $end
+        SecretSecure  = $secretSecure
     }
 }
 
@@ -1354,8 +1550,10 @@ Export-ModuleMember -Function `
     Resolve-DiscoveryAppCreateAction, `
     New-DiscoveryKeyCredential, `
     New-DiscoveryAppPayload, `
+    New-DiscoveryPasswordCredentialPayload, `
     Connect-DiscoveryGraph, `
     New-DiscoveryAppRegistration, `
     Add-DiscoveryAppCredential, `
+    New-DiscoveryAppClientSecret, `
     Grant-DiscoveryAdminConsent, `
     Remove-DiscoveryAppRegistration

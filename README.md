@@ -5,9 +5,12 @@ Phase 1 discovery stage of an Entra ID security assessment.
 
 Where a general-purpose "everything an Entra/M365 audit might ever need" app registration is
 deliberately broad, **this app registration is deliberately narrow**: it carries only the
-read permissions the Phase 1 discovery runbook actually uses, and it authenticates with a
-**certificate whose private key is sealed in a TPM** rather than a client secret — so the
-credential is bound to a single, customer-controlled Windows 11 endpoint.
+read permissions the Phase 1 discovery runbook actually uses, and — by default — it
+authenticates with a **certificate whose private key is sealed in a TPM** rather than a
+client secret, so the credential is bound to a single, customer-controlled Windows 11
+endpoint. Engagements that cannot meet that bar can select a weaker credential pathway via
+`-CredentialMode` — always as an explicit, disclosed opt-in, never a silent fallback (see
+[Credential pathways](#credential-pathways)).
 
 > **New to the tool?** Start with the
 > [customer provisioning runbook](docs/customer-provisioning-runbook.md) — a step-by-step,
@@ -32,7 +35,9 @@ Two requirements shape the design:
 
 ## How authentication works
 
-Two things combine to give a credential that is both least-privilege and machine-bound:
+This section describes the **default (`TpmBound`) credential pathway**; the four explicit
+alternatives are covered in [Credential pathways](#credential-pathways). Two things combine to
+give a credential that is both least-privilege and machine-bound:
 
 1. **Certificate credential instead of a client secret.** Only the public certificate
    (`.cer`) is uploaded to the app registration. The client proves its identity by signing a
@@ -79,19 +84,62 @@ directly (group assignment is not honoured for service principals).
 
 ---
 
+## Credential pathways
+
+`-CredentialMode` selects which credential the app registration authenticates with. There are
+**five pathways**, ranked by assurance; **`TpmBound` is the default**, and the tool **never
+downgrades on its own** — every weaker pathway is an explicit opt-in. Full mechanics,
+trade-offs and selection guidance:
+[`docs/reference/credential-modes.md`](docs/reference/credential-modes.md).
+
+| Rank | Mode | Mechanics | Downside | Ack required? |
+|------|------|-----------|----------|---------------|
+| 1 — highest | **`TpmBound`** (default) | Generates a non-exportable RSA-2048 key inside **this machine's TPM**; only the public `.cer` leaves the box. | Needs a Windows endpoint with a TPM 2.0; the credential is welded to that machine. | No |
+| 2 — high | **`ProviderHostedCert`** | Imports a Proaxiom-provided public cert whose private key is TPM-bound on a **Proaxiom-operated Azure VM**; optionally verifies the supplied TPM attestation bundle. | Proaxiom retains custody of the key — a trust/contract trade-off instead of customer-held hardware. | No (custody disclosed) |
+| 3 — holder-dependent | **`ImportPublicCert`** | Embeds the customer's **own** public cert; the tool never sees the private key. | Assurance is entirely holder-dependent — the tool cannot verify how the key is generated or protected. | No |
+| 4 — reduced | **`ImportPrivateKey`** | Installs a supplied **PFX/P12 (certificate + private key)** into the store; the store copy is non-exportable. | The source PFX is a portable private key — every surviving copy can mint tokens from any machine. | **Yes** |
+| 5 — lowest | **`ClientSecret`** | No certificate at all: a Graph-generated **bearer secret** is the credential, printed exactly once. | Anyone holding the string *is* the app, from anywhere — no possession proof, no machine binding. | **Yes** |
+
+### Posture disclosure and the acknowledgement gate
+
+- **Every** run prints the selected pathway's security-posture block (assurance level,
+  summary, downsides, recommendation) **before any TPM probe, file write, or tenant
+  contact** — including the default mode, including under `-WhatIf`. No switch disables it.
+- The two **reduced-assurance** pathways (`ImportPrivateKey`, `ClientSecret`) additionally
+  gate on an explicit operator acknowledgement after the posture block: an interactive
+  session is prompted (anything other than an explicit yes aborts); a non-interactive session
+  must pass `-AcknowledgeReducedAssurance`; otherwise the run **fails closed** without
+  touching the tenant.
+- Secret material moved by the reduced pathways (a client-secret value; a PFX and its
+  password) is handed over only via **Proaxiom Pass** (<https://pass.proaxiom.com>) one-time
+  links — see the
+  [handover rules](docs/reference/credential-modes.md#secret-and-pfx-handover--proaxiom-pass).
+
+### Back-compatibility
+
+Existing invocations are unchanged: a plain `-GenerateLocal` run **is** the `TpmBound`
+pathway, and a plain `-CertPath` import **is** `ImportPublicCert` — `-CredentialMode` simply
+makes the choice (and its posture) explicit. `TpmBound` still **fails closed** when no usable
+TPM / Platform Crypto Provider is present: there is no silent software-key fallback and no
+silent downgrade to a weaker pathway — the reduced modes are explicit opt-ins only.
+
+---
+
 ## Usage — modes and switches
 
-The single entry script `New-ProaxiomDiscoveryApp.ps1` selects one of **two parameter sets**
-by the key-source switch you pass, then layers the app-registration, cross-user, and
-attestation steps on top as opt-in switches. All tenant-mutating steps honour
+The single entry script `New-ProaxiomDiscoveryApp.ps1` provisions one of the five
+[credential pathways](#credential-pathways) selected by `-CredentialMode` (default `TpmBound`;
+inferred from `-CertPath`/`-PfxPath` when omitted), over **two underlying parameter sets**
+chosen by the key-source switch you pass. The app-registration, cross-user, and attestation
+steps layer on top as opt-in switches. All tenant-mutating steps honour
 `-WhatIf`/`ShouldProcess`.
 
 ### Key-source parameter sets
 
 | Parameter set | Selected by | Meaning | Use when |
 |---------------|-------------|---------|----------|
-| **`GenerateLocal`** (default) | `-GenerateLocal` (implicit default) | Generate a new RSA-2048 signing key in the **local** TPM (Microsoft Platform Crypto Provider, non-exportable, `LocalMachine\My`), prove non-exportability, and export only the public `.cer`. Fails closed if no usable TPM/MPCP is present. | Running **on the target endpoint** — the on-box provisioning path. |
-| **`ImportCert`** | `-CertPath <file>` (mandatory) | Key was generated on **another** machine; supply only the public certificate (`.cer` / PEM / base64). No local key-gen. | Running on an admin workstation while the real key lives on the locked endpoint. |
+| **`GenerateLocal`** (default) | `-GenerateLocal` (implicit default) | Generate a new RSA-2048 signing key in the **local** TPM (Microsoft Platform Crypto Provider, non-exportable, `LocalMachine\My`), prove non-exportability, and export only the public `.cer`. Fails closed if no usable TPM/MPCP is present. This **is** the `TpmBound` pathway. | Running **on the target endpoint** — the on-box provisioning path. |
+| **`ImportCert`** | `-CertPath <file>` (mandatory) | Key was generated on **another** machine; supply only the public certificate (`.cer` / PEM / base64). No local key-gen. This **is** the `ImportPublicCert` pathway; add `-CredentialMode ProviderHostedCert` when the supplied cert is the Proaxiom-provided one. | Running on an admin workstation while the real key lives on the locked endpoint. |
 
 `GenerateLocal`-only parameters:
 
@@ -113,7 +161,11 @@ attestation steps on top as opt-in switches. All tenant-mutating steps honour
 |--------------------|---------|
 | `-StoreLocation LocalMachine\|CurrentUser` | Where the key/cert lives. Defaults to `LocalMachine`. |
 | `-Force` | Overwrite an existing exported certificate file (`GenerateLocal`). |
-| `-CreateAppRegistration` | Create a **new** app + service principal with the trimmed read-only permission set, embedding the public key as a `keyCredential` at creation (no separate upload step). Mutually exclusive with `-AppObjectId`. |
+| `-CredentialMode <mode>` | Select the [credential pathway](#credential-pathways): `TpmBound` (default) \| `ProviderHostedCert` \| `ImportPublicCert` \| `ImportPrivateKey` \| `ClientSecret`. Inferred when omitted (`-CertPath` → `ImportPublicCert`, `-PfxPath` → `ImportPrivateKey`, else `TpmBound`). Every mode prints its security posture before anything is provisioned. |
+| `-PfxPath <file>` | Path to a PFX/P12 bundle (certificate + **private key**) to install (`ImportPrivateKey` pathway only). The store copy is installed **non-exportable**; securely delete the source PFX (and every copy) after a successful import. |
+| `-PfxPassword <securestring>` | Password for `-PfxPath` as a **SecureString** (e.g. `(Read-Host -AsSecureString 'PFX password')`). Omit for a password-less PFX. |
+| `-AcknowledgeReducedAssurance` | Explicit operator acknowledgement for the reduced-assurance pathways (`ImportPrivateKey`, `ClientSecret`). Without it, an interactive session is prompted and a non-interactive session **fails closed**. |
+| `-CreateAppRegistration` | Create a **new** app + service principal with the trimmed read-only permission set, embedding the public key as a `keyCredential` at creation (no separate upload step). Mutually exclusive with `-AppObjectId`. In `ClientSecret` mode the app is created with **no** certificate and a client secret is attached instead. |
 | `-AppObjectId <id>` | Attach the cert to an **existing** app registration instead of creating one. Mutually exclusive with `-CreateAppRegistration`. |
 | `-GrantConsent` | Grant tenant-wide admin consent programmatically (otherwise portal-consent instructions are printed). Only valid with `-CreateAppRegistration`. |
 | `-DisplayName <name>` | Display name for the created app. Defaults to the production name; overridden by `-TestNaming`. |
@@ -122,8 +174,8 @@ attestation steps on top as opt-in switches. All tenant-mutating steps honour
 | `-TenantId <id>` | Tenant to connect to for the app-registration operations. |
 | `-GrantUser <account>` | Add a Read ACE to the `LocalMachine` private-key ACL so a *different* (non-admin) operator account can sign. `CurrentUser` keys warn + no-op. See [Cross-user key access](#cross-user-key-access). |
 | `-GrantUserThumbprint <x5t>` | Target an **existing** key (by thumbprint) for `-GrantUser` instead of the one provisioned this run. |
-| `-Attest` | Produce (`GenerateLocal`) or verify (`ImportCert`) a TPM key-attestation bundle. Windows-only. See [Proving the key is TPM-bound](#proving-the-key-is-tpm-bound). |
-| `-AttestationPath <file>` | Where to write (`GenerateLocal`) or read (`ImportCert`) the attestation bundle. Defaults to `<thumbprint>.attestation.json` beside the cert. |
+| `-Attest` | Produce (`TpmBound`) or verify (`ImportPublicCert` / `ProviderHostedCert`) a TPM key-attestation bundle. Windows-only; not valid in `ImportPrivateKey` / `ClientSecret` (nothing attestable). See [Proving the key is TPM-bound](#proving-the-key-is-tpm-bound). |
+| `-AttestationPath <file>` | Where to write (`TpmBound`) or read (the import modes) the attestation bundle. Defaults to `<thumbprint>.attestation.json` beside the cert. In `ProviderHostedCert` mode a supplied bundle is verified automatically — no `-Attest` needed. |
 | `-RequireHardwareRoot` | Opt-in hard-fail when the TPM Endorsement Key does **not** chain to a trusted manufacturer root. Default is report + warn. |
 
 ### Worked examples
@@ -181,6 +233,35 @@ Produce a TPM attestation bundle alongside key generation:
 
 ```powershell
 .\New-ProaxiomDiscoveryApp.ps1 -GenerateLocal -Attest -AttestationPath C:\temp\key.attestation.json
+```
+
+Provider-hosted certificate (private key TPM-bound on a Proaxiom-operated Azure VM): import
+the Proaxiom-provided public cert, verify the supplied TPM attestation bundle, and create the
+app:
+
+```powershell
+.\New-ProaxiomDiscoveryApp.ps1 -CredentialMode ProviderHostedCert `
+  -CertPath provider.cer -AttestationPath provider-bundle.json `
+  -CreateAppRegistration
+```
+
+Install a supplied PFX (reduced assurance — acknowledged). The store copy goes into
+`LocalMachine\My` **non-exportable**; `-PfxPassword` takes a SecureString; **delete every
+copy of the source PFX after the import** — it remains a portable private key:
+
+```powershell
+.\New-ProaxiomDiscoveryApp.ps1 -CredentialMode ImportPrivateKey `
+  -PfxPath .\supplied.pfx -PfxPassword (Read-Host -AsSecureString 'PFX password') `
+  -AcknowledgeReducedAssurance
+```
+
+Client secret (lowest assurance — acknowledged): the app is created with **no certificate**
+and a Graph-generated secret attached; the secret value is printed **exactly once** with
+Proaxiom Pass handover instructions, and the tool never stores it:
+
+```powershell
+.\New-ProaxiomDiscoveryApp.ps1 -CredentialMode ClientSecret `
+  -CreateAppRegistration -GrantConsent -AcknowledgeReducedAssurance
 ```
 
 Authenticate with the TPM-resident certificate once the app exists and consent is granted:
@@ -258,9 +339,12 @@ but **not in a way Entra itself checks**. There are three tiers:
 
 Attestation can only be **produced** on the machine that holds the key:
 
-- `GenerateLocal` → the script can produce the attestation bundle right after key-gen.
-- `ImportCert` → the script can only **verify** a bundle that was generated and shipped from
-  the source endpoint alongside the `.cer`.
+- `TpmBound` (a `-GenerateLocal` run) → the script can produce the attestation bundle right
+  after key-gen.
+- `ImportPublicCert` / `ProviderHostedCert` → the script can only **verify** a bundle that was
+  generated and shipped from the source endpoint alongside the `.cer` (`ProviderHostedCert`
+  auto-verifies a supplied `-AttestationPath` bundle without `-Attest`).
+- `ImportPrivateKey` / `ClientSecret` → nothing attestable; `-Attest` is rejected.
 
 ### Caveat for virtual TPMs (the vTPM EK gap)
 
@@ -353,7 +437,7 @@ entraid-discovery-app/
 ├── README.md                         # this file
 ├── New-ProaxiomDiscoveryApp.ps1      # combined provisioning script (entry point)
 ├── src/                              # KeyGeneration, Manifest, AppRegistration, CrossUser,
-│                                     #   Attestation, Output, Common modules
+│                                     #   Attestation, CredentialPosture, Output, Common modules
 ├── tests/                            # Pester Tier A + Tier B suites
 ├── manifests/
 │   ├── permissions.csv               # 53-row GUID-accurate permission manifest
@@ -362,6 +446,7 @@ entraid-discovery-app/
     ├── customer-provisioning-runbook.md  # step-by-step provisioning walkthrough
     └── reference/
         ├── permissions.md            # keep / remove / add tables + rationale
+        ├── credential-modes.md       # the five -CredentialMode pathways + acknowledgement gate
         └── attestation.md            # -Attest behaviour + assurance limitations
 ```
 
@@ -381,9 +466,15 @@ entraid-discovery-app/
 
 ## Security notes
 
-- The provisioning script never creates a client secret. The credential is cert-only.
-- Only the public certificate ever leaves the endpoint. The private key is non-exportable and
-  TPM-resident.
+- The credential is **certificate-first**. Every default pathway is certificate-based; a
+  client secret is created only via the explicit, lowest-assurance `-CredentialMode
+  ClientSecret` opt-in, which prints its posture first, requires an operator acknowledgement,
+  prints the secret value exactly once (Proaxiom Pass handover), and never stores it.
+- In the default `TpmBound` pathway, only the public certificate ever leaves the endpoint —
+  the private key is non-exportable and TPM-resident. (`ImportPrivateKey` necessarily handles
+  a transported PFX; its posture block and the
+  [handover rules](docs/reference/credential-modes.md#secret-and-pfx-handover--proaxiom-pass)
+  cover the required hygiene, including deleting every PFX copy after import.)
 - The app registration lives in the **customer** tenant; the customer can revoke at any time
   by removing the key credential or disabling the service principal.
 - No outbound writes to the customer tenant occur beyond the explicit app registration / cert

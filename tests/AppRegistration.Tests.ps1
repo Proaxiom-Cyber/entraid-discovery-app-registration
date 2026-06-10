@@ -178,6 +178,65 @@ Describe 'App-registration pure logic (Tier A)' {
             $p  = New-DiscoveryAppPayload -DisplayName 'y' -KeyCredential $kc
             @($p.keyCredentials).Count | Should -Be 1
         }
+
+        It 'with -NoKeyCredential needs no cert and OMITS the keyCredentials key entirely' {
+            $p = New-DiscoveryAppPayload -DisplayName 'NoCert App' -NoKeyCredential
+            $p.ContainsKey('keyCredentials') | Should -BeFalse -Because 'the key is omitted, not set to an empty array'
+            $p.displayName    | Should -BeExactly 'NoCert App'
+            $p.signInAudience | Should -BeExactly 'AzureADMyOrg'
+            @($p.requiredResourceAccess).Count | Should -Be 1
+            @($p.requiredResourceAccess[0].resourceAccess).Count | Should -Be 53
+        }
+    }
+
+    Context 'New-DiscoveryPasswordCredentialPayload (ClientSecret pathway)' {
+
+        It 'defaults: displayName + endDateTime of now + 6 months (UTC)' {
+            $low  = (Get-Date).ToUniversalTime().AddMonths(6).AddMinutes(-5)
+            $p    = New-DiscoveryPasswordCredentialPayload
+            $high = (Get-Date).ToUniversalTime().AddMonths(6).AddMinutes(5)
+
+            $p.displayName | Should -BeExactly 'Proaxiom discovery client secret'
+            $p.endDateTime | Should -BeOfType [datetime]
+            $p.endDateTime | Should -BeGreaterThan $low
+            $p.endDateTime | Should -BeLessThan $high
+        }
+
+        It 'honours -ValidityMonths' {
+            $p = New-DiscoveryPasswordCredentialPayload -ValidityMonths 12
+            $p.endDateTime | Should -BeGreaterThan (Get-Date).ToUniversalTime().AddMonths(12).AddMinutes(-5)
+            $p.endDateTime | Should -BeLessThan    (Get-Date).ToUniversalTime().AddMonths(12).AddMinutes(5)
+        }
+
+        It 'honours a custom -DisplayName' {
+            (New-DiscoveryPasswordCredentialPayload -DisplayName 'zzTEST secret').displayName |
+                Should -BeExactly 'zzTEST secret'
+        }
+
+        It 'rejects -ValidityMonths outside 1..24' {
+            { New-DiscoveryPasswordCredentialPayload -ValidityMonths 0 }  | Should -Throw
+            { New-DiscoveryPasswordCredentialPayload -ValidityMonths 25 } | Should -Throw
+        }
+
+        It 'carries exactly displayName + endDateTime (Graph generates the VALUE server-side)' {
+            $p = New-DiscoveryPasswordCredentialPayload
+            (@($p.Keys | Sort-Object) -join ',') | Should -Be 'displayName,endDateTime'
+        }
+    }
+
+    Context 'ClientSecret pathway exports + safety metadata' {
+
+        It 'exports New-DiscoveryPasswordCredentialPayload and New-DiscoveryAppClientSecret' {
+            Get-Command New-DiscoveryPasswordCredentialPayload -ErrorAction SilentlyContinue |
+                Should -Not -BeNullOrEmpty
+            Get-Command New-DiscoveryAppClientSecret -ErrorAction SilentlyContinue |
+                Should -Not -BeNullOrEmpty
+        }
+
+        It 'New-DiscoveryAppClientSecret supports ShouldProcess (-WhatIf gates the tenant write)' {
+            # Metadata-only check: the live wrapper is never invoked in Tier A.
+            (Get-Command New-DiscoveryAppClientSecret).Parameters.ContainsKey('WhatIf') | Should -BeTrue
+        }
     }
 
     Context 'New-DiscoveryAppDisplayName naming convention' {

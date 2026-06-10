@@ -18,7 +18,7 @@
     SKIP-GATED. The tests that require a real TPM are gated behind
     $script:OnTpmHost = (Test-IsWindows) -and (Test-PlatformCryptoProvider).Available
     so this file is GREEN-WITH-SKIPS on a non-TPM host (e.g. macOS dev box) and
-    executes for real only on a Windows + TPM host (e.g. WIN11TEST / vTPM).
+    executes for real only on a Windows + TPM host (physical or vTPM).
 
     The ImportCert and off-Windows fail-closed Contexts run ANYWHERE (they only
     need pwsh + Pester v5 + openssl).
@@ -46,6 +46,11 @@ BeforeDiscovery {
     # with a usable TPM the MPCP opens via CNG and the real tests run.
     # ----------------------------------------------------------------------
     $isWin = if ($PSVersionTable.PSEdition -eq 'Desktop') { $true } else { [bool]$IsWindows }
+
+    # Windows-only gate (no TPM required) for tests that exercise the Windows
+    # certificate store but not the MPCP -- e.g. the Import-DiscoveryPfx
+    # store-install pathway. Gate on Windows, NOT on TPM.
+    $script:OnWindowsHost = $isWin
 
     $script:OnTpmHost = $false
     if ($isWin) {
@@ -90,7 +95,7 @@ Describe 'KeyGeneration.psm1 — TPM-backed key generation (Tier B)' {
     }
 
     AfterAll {
-        # --- Teardown: keep the persistent WIN11TEST VM clean across runs. -----
+        # --- Teardown: keep the persistent TPM test host clean across runs. ----
         # Remove any cert whose subject mentions zzTEST-DiscoveryKey from both
         # personal stores. Guarded with the Windows check because Cert:\ store
         # removal is a no-op / unavailable off-Windows.
@@ -259,13 +264,22 @@ Describe 'KeyGeneration.psm1 — TPM-backed key generation (Tier B)' {
 
     Context 'Fail-closed: Test-PlatformCryptoProvider off a TPM host' {
 
-        # Runs ANYWHERE. On this Mac the provider must report unavailable with a
-        # Windows-mentioning reason; this is the load-bearing proof that the skip
-        # gate above is actually engaging (i.e. we are NOT on a TPM host).
+        # Runs in every NON-TPM environment; skips only on a TPM-equipped CI
+        # runner (Available=$true / Reason='OK'). The suite runs in THREE
+        # environments and the fail-closed Reason differs across them:
+        #   - macOS / non-Windows dev box  -> 'Not a Windows host'
+        #   - GitHub-hosted windows-latest -> 'TPM not present' (Windows, no
+        #     vTPM); a TPM-bearing box with a broken provider would instead
+        #     report 'TPM present but not ready' or the MPCP reasons ('... not
+        #     listed by certutil -csplist' / '... failed to open via CNG')
+        #   - Windows WITH a usable TPM (TPM-equipped CI runner) -> SKIPPED here
+        # This is the load-bearing proof that the skip gate above is actually
+        # engaging (i.e. we are NOT on a usable TPM host).
         It '10. reports Available = $false when not on a TPM host' -Skip:($script:OnTpmHost) {
             $status = Test-PlatformCryptoProvider
             $status.Available | Should -BeFalse -Because 'no TPM/MPCP here -> fail closed'
-            $status.Reason    | Should -BeLike '*Windows*'
+            $status.Reason    | Should -Match 'Windows|TPM|Platform Crypto' `
+                -Because 'every fail-closed path names the missing capability (host OS, TPM, or MPCP) and the success Reason OK matches none of these'
         }
     }
 
@@ -326,6 +340,141 @@ Describe 'KeyGeneration.psm1 — TPM-backed key generation (Tier B)' {
 
             $pem.Thumbprint | Should -BeExactly $der.Thumbprint -Because 'same cert, different encoding'
             $b64.Thumbprint | Should -BeExactly $der.Thumbprint -Because 'same cert, different encoding'
+        }
+    }
+
+    # =======================================================================
+    # IMPORT-DISCOVERYPFX -- ImportPrivateKey pathway (store install).
+    # Gated on WINDOWS (the certificate store), NOT on a TPM.
+    # =======================================================================
+    Context 'Import-DiscoveryPfx: fails closed off-Windows' {
+
+        It '13. throws a Windows-required error on a non-Windows host' -Skip:($script:OnWindowsHost) {
+            # The Windows gate is checked FIRST, so the file does not need to exist.
+            $pfxPath = Join-Path $script:TmpDir 'does-not-matter.pfx'
+            { Import-DiscoveryPfx -Path $pfxPath -StoreLocation CurrentUser } |
+                Should -Throw -ExpectedMessage '*Windows*'
+        }
+    }
+
+    Context 'Import-DiscoveryPfx: rejects a public-only certificate file (any host)' {
+
+        BeforeAll {
+            # Self-contained public-cert fixture (DER .cer) -- built here rather
+            # than reusing the ImportCert fixture so this Context has no ordering
+            # dependency on its siblings.
+            $script:PubOnlyDir = Join-Path $script:TmpDir 'pfx-pubonly'
+            New-Item -ItemType Directory -Path $script:PubOnlyDir -Force | Out-Null
+
+            $keyPath           = Join-Path $script:PubOnlyDir 'key.pem'
+            $pemPath           = Join-Path $script:PubOnlyDir 'cert.pem'
+            $script:PubOnlyCer = Join-Path $script:PubOnlyDir 'public-only.cer'
+
+            # Native stderr under WinPS 5.1 + EAP=Stop raises a terminating error
+            # even with 2>$null; scope a LOCAL Continue (mirrors the ImportCert
+            # Context above).
+            $ErrorActionPreference = 'Continue'
+
+            & openssl req -x509 -newkey rsa:2048 -nodes `
+                -keyout $keyPath -out $pemPath -days 30 `
+                -subj '/CN=zzTEST-PfxPublicOnly' 2>$null
+            if ($LASTEXITCODE -ne 0) { throw "openssl req failed (exit $LASTEXITCODE)" }
+
+            & openssl x509 -in $pemPath -outform DER -out $script:PubOnlyCer 2>$null
+            if ($LASTEXITCODE -ne 0) { throw "openssl x509 (DER) failed (exit $LASTEXITCODE)" }
+        }
+
+        It '14. throws for a public-cert (non-PFX) input on every host' {
+            # Off-Windows the fail-closed Windows gate throws first; on Windows the
+            # file loads with HasPrivateKey = $false and the no-private-key guidance
+            # throws (or a parse error if the host cannot load the file). Every
+            # path throws -- a public-only cert NEVER imports through the PFX path.
+            { Import-DiscoveryPfx -Path $script:PubOnlyCer -StoreLocation CurrentUser } | Should -Throw
+        }
+    }
+
+    Context 'Import-DiscoveryPfx: installs a PFX into CurrentUser\My (Windows)' -Skip:(-not $script:OnWindowsHost) {
+
+        BeforeAll {
+            # Throwaway openssl-built PFX. The password is a DUMMY test fixture
+            # (never a real secret). CurrentUser avoids requiring an elevated
+            # test runner.
+            $script:PfxDir = Join-Path $script:TmpDir 'pfx-import'
+            New-Item -ItemType Directory -Path $script:PfxDir -Force | Out-Null
+
+            $keyPath           = Join-Path $script:PfxDir 'key.pem'
+            $pemPath           = Join-Path $script:PfxDir 'cert.pem'
+            $script:PfxPath    = Join-Path $script:PfxDir 'fixture.pfx'
+            $script:PfxCerPath = Join-Path $script:PfxDir 'fixture.cer'
+
+            $pfxPassPlain       = 'zzTEST-dummy-pfx-password'
+            $script:PfxPassword = ConvertTo-SecureString $pfxPassPlain -AsPlainText -Force
+
+            # openssl writes progress to stderr; scope a LOCAL 'Continue' so WinPS
+            # 5.1 + EAP=Stop does not turn that into a terminating NativeCommandError.
+            $ErrorActionPreference = 'Continue'
+
+            & openssl req -x509 -newkey rsa:2048 -nodes `
+                -keyout $keyPath -out $pemPath -days 30 `
+                -subj '/CN=zzTEST-DiscoveryKey-PfxFixture' 2>$null
+            if ($LASTEXITCODE -ne 0) { throw "openssl req failed (exit $LASTEXITCODE)" }
+
+            & openssl pkcs12 -export -out $script:PfxPath -inkey $keyPath -in $pemPath `
+                -passout "pass:$pfxPassPlain" 2>$null
+            if ($LASTEXITCODE -ne 0) { throw "openssl pkcs12 failed (exit $LASTEXITCODE)" }
+
+            & openssl x509 -in $pemPath -outform DER -out $script:PfxCerPath 2>$null
+            if ($LASTEXITCODE -ne 0) { throw "openssl x509 (DER) failed (exit $LASTEXITCODE)" }
+
+            # Import ONCE for the whole Context.
+            $script:PfxMeta = Import-DiscoveryPfx -Path $script:PfxPath `
+                -Password $script:PfxPassword -StoreLocation CurrentUser
+        }
+
+        AfterAll {
+            # Remove the imported fixture cert from CurrentUser\My. (The
+            # Describe-level sweep on *zzTEST-DiscoveryKey* is the belt-and-braces
+            # fallback -- this subject deliberately matches it.)
+            if ($script:IsWindowsHost) {
+                try {
+                    Get-ChildItem -LiteralPath 'Cert:\CurrentUser\My' -ErrorAction SilentlyContinue |
+                        Where-Object { $_.Subject -like '*zzTEST-DiscoveryKey-PfxFixture*' } |
+                        ForEach-Object {
+                            Remove-Item -LiteralPath (Join-Path 'Cert:\CurrentUser\My' $_.Thumbprint) `
+                                        -Force -ErrorAction SilentlyContinue
+                        }
+                }
+                catch {
+                    # Best-effort cleanup; never fail the run on teardown.
+                }
+            }
+        }
+
+        It '15. imports with HasPrivateKey = $true' {
+            $script:PfxMeta.HasPrivateKey | Should -BeTrue -Because 'a PFX carries the private key'
+            $script:PfxMeta.Subject       | Should -Match 'zzTEST-DiscoveryKey-PfxFixture'
+        }
+
+        It '16. the certificate is present in the CurrentUser\My store' {
+            Test-Path -LiteralPath "Cert:\CurrentUser\My\$($script:PfxMeta.Thumbprint)" | Should -BeTrue
+        }
+
+        It '17. metadata carries the full StorePath and ImportedFromPfx = $true' {
+            $script:PfxMeta.StorePath       | Should -BeExactly "Cert:\CurrentUser\My\$($script:PfxMeta.Thumbprint)"
+            $script:PfxMeta.ImportedFromPfx | Should -BeTrue
+        }
+
+        It '18. a wrong password throws a clear, actionable error' {
+            $wrong = ConvertTo-SecureString 'zzTEST-wrong-password' -AsPlainText -Force
+            { Import-DiscoveryPfx -Path $script:PfxPath -Password $wrong -StoreLocation CurrentUser } |
+                Should -Throw -ExpectedMessage '*-Password*'
+        }
+
+        It '19. a public-only .cer is rejected with the no-private-key guidance' {
+            $err = { Import-DiscoveryPfx -Path $script:PfxCerPath -StoreLocation CurrentUser } |
+                Should -Throw -PassThru
+            $err.Exception.Message | Should -Match 'private key'
+            $err.Exception.Message | Should -Match 'ImportPublicCert' -Because 'the error must point at the public-cert pathway'
         }
     }
 }
