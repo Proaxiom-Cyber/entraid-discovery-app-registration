@@ -92,7 +92,9 @@
     securely delete the source PFX (and every copy) after a successful import.
 
 .PARAMETER PfxPassword
-    Password for -PfxPath as a SecureString. Omit for a password-less PFX.
+    Password for -PfxPath as a SecureString. Prompted interactively when omitted
+    (press Enter at the prompt for a password-less PFX); in non-interactive
+    sessions an omitted password is treated as a password-less PFX.
 
 .PARAMETER AcknowledgeReducedAssurance
     Explicit operator acknowledgement that a REDUCED-ASSURANCE credential pathway
@@ -143,8 +145,10 @@
 
     ImportPrivateKey pathway (reduced assurance, acknowledged): installs the
     supplied PFX into LocalMachine\My (store copy non-exportable), exports its
-    public certificate and creates the app registration with it. Securely delete
-    the source PFX after the import.
+    public certificate and creates the app registration with it. -PfxPassword is
+    prompted interactively when omitted; in non-interactive sessions an omitted
+    password is treated as a password-less PFX. Securely delete the source PFX
+    after the import.
 
 .EXAMPLE
     ./New-ProaxiomDiscoveryApp.ps1 -CredentialMode ClientSecret -CreateAppRegistration -DisplayName 'Contoso Discovery' -AcknowledgeReducedAssurance
@@ -200,7 +204,9 @@ param(
     [ValidateNotNullOrEmpty()]
     [string]$PfxPath,
 
-    # Password for -PfxPath (omit for a password-less PFX).
+    # Password for -PfxPath. Prompted interactively when omitted (press Enter at
+    # the prompt for a password-less PFX); in non-interactive sessions an omitted
+    # password is treated as a password-less PFX.
     [securestring]$PfxPassword,
 
     # Explicit operator acknowledgement for the reduced-assurance pathways
@@ -588,6 +594,21 @@ switch ($effectiveMode) {
         #    gated: under -WhatIf nothing is installed and $meta/$certificate stay
         #    $null (handled downstream exactly like the TpmBound -WhatIf path).
         if ($PSCmdlet.ShouldProcess("$StoreLocation\My", "Install PFX '$PfxPath' (certificate + private key)")) {
+            # 1a. Docs parity: -PfxPassword is PROMPTED interactively when omitted.
+            #     Gated on the SAME interactivity probe as the acknowledgement gate
+            #     above ($ackInteractive: UserInteractive AND stdin not redirected)
+            #     so the two features agree on what "interactive" means. An empty
+            #     entry (just Enter) means a password-less PFX ($null password).
+            #     Non-interactive sessions never prompt: an omitted password is
+            #     treated as a password-less PFX, and Import-DiscoveryPfx's
+            #     actionable error covers the wrong/missing-password case.
+            if ($pfxPathBound -and -not $PSBoundParameters.ContainsKey('PfxPassword') -and $ackInteractive) {
+                $PfxPassword = Read-Host -AsSecureString 'PFX password (press Enter if the file has no password)'
+                if ($PfxPassword.Length -eq 0) {
+                    $PfxPassword = $null
+                }
+            }
+
             $meta = Import-DiscoveryPfx -Path $PfxPath -Password $PfxPassword -StoreLocation $StoreLocation
 
             # Import-DiscoveryPfx's StorePath is the FULL Cert: item path; load the

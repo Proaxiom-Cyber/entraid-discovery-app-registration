@@ -561,6 +561,64 @@ Describe 'CredentialMode parameter surface and guards (Task 8.4)' {
         }
     }
 
+    Context 'PFX password interactive prompt (docs parity)' {
+
+        # The public docs promise: "-PfxPassword is prompted interactively when
+        # omitted". Assert structurally (via the AST -- no execution, no real
+        # prompt) that the entry script contains a Read-Host -AsSecureString
+        # invocation gated on BOTH the "-PfxPassword was not bound" check and the
+        # interactivity probe (the same probe the acknowledgement gate uses), so
+        # non-interactive runs never prompt and stay on the password-less path.
+        It 'prompts for an omitted -PfxPassword (Read-Host -AsSecureString) gated on the interactivity probe' {
+            $tokens = $null
+            $parseErrors = $null
+            $ast = [System.Management.Automation.Language.Parser]::ParseFile(
+                $script:ScriptPath, [ref]$tokens, [ref]$parseErrors)
+            @($parseErrors).Count | Should -Be 0 -Because 'the entry script must parse without errors'
+
+            # Every Read-Host -AsSecureString invocation in the script.
+            $readHosts = @($ast.FindAll({
+                param($node)
+                ($node -is [System.Management.Automation.Language.CommandAst]) -and
+                ($node.GetCommandName() -eq 'Read-Host') -and
+                (@($node.CommandElements | Where-Object {
+                    ($_ -is [System.Management.Automation.Language.CommandParameterAst]) -and
+                    ($_.ParameterName -eq 'AsSecureString')
+                }).Count -gt 0)
+            }, $true))
+
+            # At least one must be the PFX password prompt: walk up its parents to
+            # an enclosing 'if' whose condition checks that -PfxPassword was NOT
+            # bound AND that the session is interactive. (Condition text is matched
+            # loosely -- ContainsKey('PfxPassword') + an interactivity variable --
+            # so the assertion survives refactors without being satisfiable by an
+            # ungated prompt.)
+            $gatedPfxPrompts = @($readHosts | Where-Object {
+                $gated  = $false
+                $parent = $_.Parent
+                while ($null -ne $parent) {
+                    if ($parent -is [System.Management.Automation.Language.IfStatementAst]) {
+                        foreach ($clause in $parent.Clauses) {
+                            $condText = $clause.Item1.Extent.Text
+                            if ($condText -match "ContainsKey\(\s*'PfxPassword'\s*\)" -and
+                                $condText -match '(?i)interactive') {
+                                $gated = $true
+                            }
+                        }
+                        if ($gated) { break }
+                    }
+                    $parent = $parent.Parent
+                }
+                $gated
+            })
+
+            $gatedPfxPrompts.Count | Should -BeGreaterThan 0 -Because (
+                'the docs promise -PfxPassword is prompted interactively when omitted, so the entry ' +
+                'script must contain a Read-Host -AsSecureString gated on the unbound-password check ' +
+                'plus the same interactivity probe as the acknowledgement gate')
+        }
+    }
+
     Context 'Credential-mode consistency guards (fire before any TPM/Graph/file work)' {
 
         # Each guard throws from pure parameter checks at the top of the script:
