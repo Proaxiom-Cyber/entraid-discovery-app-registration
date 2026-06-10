@@ -95,7 +95,7 @@ trade-offs and selection guidance:
 | Rank | Mode | Mechanics | Downside | Ack required? |
 |------|------|-----------|----------|---------------|
 | 1 — highest | **`TpmBound`** (default) | Generates a non-exportable RSA-2048 key inside **this machine's TPM**; only the public `.cer` leaves the box. | Needs a Windows endpoint with a TPM 2.0; the credential is welded to that machine. | No |
-| 2 — high | **`ProviderHostedCert`** | Imports a Proaxiom-provided public cert whose private key is TPM-bound on a **Proaxiom-operated Azure VM**; optionally verifies the supplied TPM attestation bundle. | Proaxiom retains custody of the key — a trust/contract trade-off instead of customer-held hardware. | No (custody disclosed) |
+| 2 — high | **`ProviderHostedCert`** | Imports a Proaxiom-provided public cert whose private key is TPM-bound on a **Proaxiom-operated Azure VM**; optionally verifies the supplied TPM attestation bundle. **Available on request once the engagement holder VM is stood up.** | Proaxiom retains custody of the key — a trust/contract trade-off instead of customer-held hardware. | No (custody disclosed) |
 | 3 — holder-dependent | **`ImportPublicCert`** | Embeds the customer's **own** public cert; the tool never sees the private key. | Assurance is entirely holder-dependent — the tool cannot verify how the key is generated or protected. | No |
 | 4 — reduced | **`ImportPrivateKey`** | Installs a supplied **PFX/P12 (certificate + private key)** into the store; the store copy is non-exportable. | The source PFX is a portable private key — every surviving copy can mint tokens from any machine. | **Yes** |
 | 5 — lowest | **`ClientSecret`** | No certificate at all: a Graph-generated **bearer secret** is the credential, printed exactly once. | Anyone holding the string *is* the app, from anywhere — no possession proof, no machine binding. | **Yes** |
@@ -235,9 +235,9 @@ Produce a TPM attestation bundle alongside key generation:
 .\New-ProaxiomDiscoveryApp.ps1 -GenerateLocal -Attest -AttestationPath C:\temp\key.attestation.json
 ```
 
-Provider-hosted certificate (private key TPM-bound on a Proaxiom-operated Azure VM): import
-the Proaxiom-provided public cert, verify the supplied TPM attestation bundle, and create the
-app:
+Provider-hosted certificate (available on request; requires Proaxiom to stand up the engagement
+holder VM and attestation bundle): import the Proaxiom-provided public cert, verify the supplied
+TPM attestation bundle, and create the app:
 
 ```powershell
 .\New-ProaxiomDiscoveryApp.ps1 -CredentialMode ProviderHostedCert `
@@ -345,6 +345,10 @@ Attestation can only be **produced** on the machine that holds the key:
   generated and shipped from the source endpoint alongside the `.cer` (`ProviderHostedCert`
   auto-verifies a supplied `-AttestationPath` bundle without `-Attest`).
 - `ImportPrivateKey` / `ClientSecret` → nothing attestable; `-Attest` is rejected.
+
+`ProviderHostedCert` is not the default self-service path: Proaxiom must first provision the
+engagement-specific Azure holder VM, generate the key there, and provide the public certificate
+and any attestation bundle for the customer-side import.
 
 ### Caveat for virtual TPMs (the vTPM EK gap)
 

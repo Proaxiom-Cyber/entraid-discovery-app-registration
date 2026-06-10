@@ -531,6 +531,25 @@ Describe 'App-registration pure logic (Tier A)' {
         }
     }
 
+    Context 'Graph write wrappers fail closed on SDK write errors' {
+
+        It 'uses -ErrorAction Stop inside service-principal creation retry' {
+            $moduleText = Get-Content -LiteralPath (Join-Path (Join-Path $script:RepoRoot 'src') 'AppRegistration.psm1') -Raw
+            $moduleText | Should -Match 'New-MgServicePrincipal\s+-AppId\s+\$newAppId\s+-ErrorAction\s+Stop' `
+                -Because 'SP-create Request_BadRequest can be non-terminating without -ErrorAction Stop, bypassing retry and orphaning the app'
+        }
+
+        It 'uses -ErrorAction Stop inside app-role assignment retry' {
+            $moduleText = Get-Content -LiteralPath (Join-Path (Join-Path $script:RepoRoot 'src') 'AppRegistration.psm1') -Raw
+            $assignmentBlock = [regex]::Match(
+                $moduleText,
+                'New-MgServicePrincipalAppRoleAssignment(?s).*?AppRoleId\s+\$roleId(?s).*?ErrorAction\s+Stop'
+            )
+            $assignmentBlock.Success | Should -BeTrue `
+                -Because 'Graph assignment failures must be terminating so Grant-DiscoveryAdminConsent cannot count a failed grant as granted'
+        }
+    }
+
     Context 'Output formatting (Connect-MgGraph example + consent)' {
 
         It 'builds a Connect-MgGraph example with placeholders when ids are unknown' {

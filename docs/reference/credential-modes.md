@@ -23,7 +23,7 @@ posture, explicit.
 | Mode | Rank | Where the private key lives | Machine-bound? | Ack required |
 |------|------|-----------------------------|----------------|--------------|
 | [`TpmBound`](#tpmbound-default) (default) | 1 — highest | This machine's TPM (non-exportable) | Yes — this machine | No |
-| [`ProviderHostedCert`](#providerhostedcert) | 2 — high | A TPM on a Proaxiom-operated Azure VM | Yes — Proaxiom's VM (Proaxiom custody) | No (custody disclosed) |
+| [`ProviderHostedCert`](#providerhostedcert) | 2 — high | A TPM on a Proaxiom-operated Azure VM; available on request once the holder VM is stood up | Yes — Proaxiom's VM (Proaxiom custody) | No (custody disclosed) |
 | [`ImportPublicCert`](#importpubliccert) | 3 — holder-dependent | Wherever the holder keeps it — the tool never sees it | Unknown to the tool | No |
 | [`ImportPrivateKey`](#importprivatekey) | 4 — reduced | A PFX file that travelled between parties | No | **Yes** |
 | [`ClientSecret`](#clientsecret) | 5 — lowest | No key at all — a bearer secret string | No | **Yes** |
@@ -93,6 +93,10 @@ optionally, a TPM attestation bundle. The customer-side run imports the public
 certificate (`-CertPath`) and can verify the supplied bundle (`-AttestationPath`). The
 private key stays inside the Azure VM's TPM — non-exportable there, exactly as in
 `TpmBound`, just on Proaxiom's machine instead of yours.
+
+**Availability.** This is an on-request engagement path, not a default self-service path.
+Proaxiom must first provision the Azure holder VM, generate the key there, and provide the
+public certificate and any attestation bundle.
 
 **What you experience.** Receive `proaxiom-provided.cer` (and optionally a `bundle.json`
 attestation bundle) from Proaxiom, then run the tool to create the app registration with
@@ -239,7 +243,8 @@ Work down the ladder and stop at the first pathway you can satisfy:
 1. **Can collection run from a TPM-equipped Windows endpoint you control?** →
    **`TpmBound`** (the default). Hardware possession proof, no custody questions.
 2. **No suitable endpoint, but hardware binding still wanted?** →
-   **`ProviderHostedCert`**, if Proaxiom key custody is acceptable contractually.
+   **`ProviderHostedCert`**, if Proaxiom key custody is acceptable contractually and the
+   engagement holder VM has been arranged.
 3. **You operate your own key infrastructure (HSM / smartcard / managed PKI)?** →
    **`ImportPublicCert`**. Custody stays with you; the assurance is yours to maintain.
 4. **A private key must move between parties anyway?** → **`ImportPrivateKey`**,

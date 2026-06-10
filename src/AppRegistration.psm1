@@ -1133,7 +1133,7 @@ function New-DiscoveryAppRegistration {
     # that transient window rather than failing (and orphaning the app).
     $newAppId = $app.AppId
     $sp = Invoke-DiscoveryGraphWithRetry -OperationName 'service-principal creation' -ScriptBlock {
-        New-MgServicePrincipal -AppId $newAppId
+        New-MgServicePrincipal -AppId $newAppId -ErrorAction Stop
     }
 
     $tenantId = $null
@@ -1433,7 +1433,8 @@ function Grant-DiscoveryAdminConsent {
                         -ServicePrincipalId $spId `
                         -PrincipalId $spId `
                         -ResourceId $resourceSpId `
-                        -AppRoleId $roleId | Out-Null
+                        -AppRoleId $roleId `
+                        -ErrorAction Stop | Out-Null
                 }
             }
             $granted++

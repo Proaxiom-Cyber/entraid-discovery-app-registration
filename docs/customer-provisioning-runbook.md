@@ -25,7 +25,7 @@ engagements where on-endpoint key generation is not possible. Ranked by assuranc
 | Mode | Assurance rank | Where the private key lives | Acknowledgement |
 |------|----------------|-----------------------------|-----------------|
 | `TpmBound` (default) | 1 — highest | This machine's TPM (non-exportable) | Not required |
-| `ProviderHostedCert` | 2 — high | A TPM on a Proaxiom-operated Azure VM (Proaxiom retains custody) | Not required (custody disclosed) |
+| `ProviderHostedCert` | 2 — high | A TPM on a Proaxiom-operated Azure VM (Proaxiom retains custody; available on request once the holder VM is stood up) | Not required (custody disclosed) |
 | `ImportPublicCert` | 3 — holder-dependent | Wherever you keep it — the tool never sees it | Not required |
 | `ImportPrivateKey` | 4 — reduced | A PFX file that travelled between parties | **Required** |
 | `ClientSecret` | 5 — lowest | No key — a bearer secret string | **Required** |
@@ -45,9 +45,9 @@ TPM prerequisite applies to `TpmBound` only.
 
 ### Alternate-pathway invocations
 
-**`ProviderHostedCert`** — Proaxiom supplies the public certificate (the key is held
-TPM-bound on a Proaxiom-operated Azure VM) and, optionally, a TPM attestation bundle the
-tool can verify:
+**`ProviderHostedCert`** — available on request when Proaxiom stands up an
+engagement-specific Azure holder VM. Proaxiom supplies the public certificate (the key is
+held TPM-bound on that VM) and, optionally, a TPM attestation bundle the tool can verify:
 
 ```powershell
 ./New-ProaxiomDiscoveryApp.ps1 -CredentialMode ProviderHostedCert `
