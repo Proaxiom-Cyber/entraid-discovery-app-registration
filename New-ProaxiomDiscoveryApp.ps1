@@ -108,6 +108,12 @@
     pick a new -DisplayName, use -TestNaming, or pass -ForceNewApp). -ForceNewApp
     creates a deliberate duplicate instead.
 
+.PARAMETER ConsentRedirectUri
+    Optional HTTPS reply URL to register on the new app and include in the printed
+    direct admin-consent URL. Use this with the Cloudflare Worker consent landing
+    page to avoid Microsoft's AADSTS500113 "No reply address" page after Path A
+    portal consent. Applies to -CreateAppRegistration only.
+
 .EXAMPLE
     ./New-ProaxiomDiscoveryApp.ps1
 
@@ -245,6 +251,11 @@ param(
     # (it throws, naming the existing app and the ways forward). -ForceNewApp creates
     # a DELIBERATE duplicate anyway. Shared across both parameter sets.
     [switch]$ForceNewApp,
+
+    # HTTPS reply URL for the Path A admin-consent completion page. Registered on
+    # the new app and included as redirect_uri in the printed consent URL.
+    [ValidatePattern('^https://')]
+    [string]$ConsentRedirectUri,
 
     # Tenant id to connect to for the app-registration operations (optional).
     [ValidateNotNullOrEmpty()]
@@ -420,6 +431,9 @@ if ($CreateAppRegistration -and -not [string]::IsNullOrWhiteSpace($AppObjectId))
 }
 if ($GrantConsent -and -not $CreateAppRegistration) {
     throw '-GrantConsent applies to -CreateAppRegistration (it grants consent on the newly created service principal).'
+}
+if (-not [string]::IsNullOrWhiteSpace($ConsentRedirectUri) -and -not $CreateAppRegistration) {
+    throw '-ConsentRedirectUri applies to -CreateAppRegistration: it registers the reply URL on the newly created app.'
 }
 
 # --- Credential-pathway posture disclosure + acknowledgement gate -------------
@@ -684,10 +698,10 @@ if ($CreateAppRegistration -or -not [string]::IsNullOrWhiteSpace($AppObjectId)) 
         if ($effectiveMode -eq 'ClientSecret') {
             # ClientSecret: create the application with NO keyCredential; the
             # Graph-generated client secret below is the credential.
-            $appResult = New-DiscoveryAppRegistration -DisplayName $name -NoKeyCredential -Force:$ForceNewApp -WhatIf:$WhatIfPreference
+            $appResult = New-DiscoveryAppRegistration -DisplayName $name -NoKeyCredential -ConsentRedirectUri $ConsentRedirectUri -Force:$ForceNewApp -WhatIf:$WhatIfPreference
         }
         else {
-            $appResult = New-DiscoveryAppRegistration -DisplayName $name -CertPath $exportedCertPath -Force:$ForceNewApp -WhatIf:$WhatIfPreference
+            $appResult = New-DiscoveryAppRegistration -DisplayName $name -CertPath $exportedCertPath -ConsentRedirectUri $ConsentRedirectUri -Force:$ForceNewApp -WhatIf:$WhatIfPreference
         }
 
         # Admin consent is OPT-IN (FR 14): only granted with -GrantConsent.

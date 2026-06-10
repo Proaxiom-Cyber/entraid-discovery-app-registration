@@ -168,6 +168,7 @@ steps layer on top as opt-in switches. All tenant-mutating steps honour
 | `-CreateAppRegistration` | Create a **new** app + service principal with the trimmed read-only permission set, embedding the public key as a `keyCredential` at creation (no separate upload step). Mutually exclusive with `-AppObjectId`. In `ClientSecret` mode the app is created with **no** certificate and a client secret is attached instead. |
 | `-AppObjectId <id>` | Attach the cert to an **existing** app registration instead of creating one. Mutually exclusive with `-CreateAppRegistration`. |
 | `-GrantConsent` | Grant tenant-wide admin consent programmatically (otherwise portal-consent instructions are printed). Only valid with `-CreateAppRegistration`. |
+| `-ConsentRedirectUri <https-url>` | Register an HTTPS reply URL on the new app and include it in the printed Path A admin-consent URL, so Microsoft returns to a controlled landing page instead of `AADSTS500113`. Only valid with `-CreateAppRegistration`. |
 | `-DisplayName <name>` | Display name for the created app. Defaults to the production name; overridden by `-TestNaming`. |
 | `-TestNaming` | Use a `zzTEST-DiscoveryApp-<timestamp>` unique naming (for repeatable test runs that are torn down afterward). |
 | `-ForceNewApp` | Deliberately create a duplicate app even when one with the same display name already exists (bypasses the idempotency guard — see [Re-run safety](#re-run-safety-idempotency)). |
@@ -204,7 +205,9 @@ Generate the key **and** create the app registration with the public key baked i
 consent for an admin to grant in the portal (consent instructions are printed):
 
 ```powershell
-.\New-ProaxiomDiscoveryApp.ps1 -GenerateLocal -CreateAppRegistration -TenantId <tenantid>
+.\New-ProaxiomDiscoveryApp.ps1 -GenerateLocal -CreateAppRegistration `
+  -TenantId <tenantid> `
+  -ConsentRedirectUri https://consent.proaxiom.com/entraid-discovery/complete
 ```
 
 Create the app **and** grant admin consent in the same run (the signed-in identity must hold

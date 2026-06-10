@@ -831,6 +831,11 @@ function New-DiscoveryAppPayload {
         is omitted entirely (not set to an empty array) and cert inputs are not
         consulted. Used by -CredentialMode ClientSecret.
 
+    .PARAMETER ConsentRedirectUri
+        Optional reply URL registered on the app so the portal admin-consent
+        flow can return to a controlled landing page instead of Microsoft's
+        AADSTS500113 "No reply address" page.
+
     .OUTPUTS
         System.Collections.Hashtable (the New-MgApplication body).
     #>
@@ -863,8 +868,20 @@ function New-DiscoveryAppPayload {
         [ValidateSet('AzureADMyOrg', 'AzureADMultipleOrgs', 'AzureADandPersonalMicrosoftAccount')]
         [string]$SignInAudience = 'AzureADMyOrg',
 
+        [Parameter()]
+        [AllowNull()]
+        [AllowEmptyString()]
+        [string]$ConsentRedirectUri,
+
         [switch]$NoKeyCredential
     )
+
+    $web = $null
+    if (-not [string]::IsNullOrWhiteSpace($ConsentRedirectUri)) {
+        $web = @{
+            redirectUris = @($ConsentRedirectUri)
+        }
+    }
 
     if ($NoKeyCredential) {
         # No-cert pathway (-CredentialMode ClientSecret): the app is created with
@@ -872,11 +889,13 @@ function New-DiscoveryAppPayload {
         # (not an empty array) and no cert input is required or consulted. The
         # client secret is added to the created app afterwards
         # (New-DiscoveryAppClientSecret).
-        return @{
+        $payload = @{
             displayName            = $DisplayName
             signInAudience         = $SignInAudience
             requiredResourceAccess = (Get-DiscoveryRequiredResourceAccess -Path $ManifestPath)
         }
+        if ($null -ne $web) { $payload['web'] = $web }
+        return $payload
     }
 
     # Resolve the keyCredential from whichever input was supplied.
@@ -896,12 +915,14 @@ function New-DiscoveryAppPayload {
 
     $rra = Get-DiscoveryRequiredResourceAccess -Path $ManifestPath
 
-    @{
+    $payload = @{
         displayName            = $DisplayName
         signInAudience         = $SignInAudience
         requiredResourceAccess = $rra
         keyCredentials         = @($keyCred)
     }
+    if ($null -ne $web) { $payload['web'] = $web }
+    $payload
 }
 
 function New-DiscoveryPasswordCredentialPayload {
@@ -1042,6 +1063,10 @@ function New-DiscoveryAppRegistration {
         Thumbprint is $null. Used by -CredentialMode ClientSecret, where
         New-DiscoveryAppClientSecret adds a client secret to the created app.
 
+    .PARAMETER ConsentRedirectUri
+        Optional reply URL registered on the app and later included in the
+        printed admin-consent URL. This avoids AADSTS500113 after portal consent.
+
     .PARAMETER Force
         Idempotency override (FR 20). By default this wrapper queries the tenant for
         an existing application of the same display name and THROWS (refusing to
@@ -1072,6 +1097,11 @@ function New-DiscoveryAppRegistration {
         [AllowEmptyString()]
         [string]$ManifestPath,
 
+        [Parameter()]
+        [AllowNull()]
+        [AllowEmptyString()]
+        [string]$ConsentRedirectUri,
+
         [switch]$NoKeyCredential,
 
         [switch]$Force
@@ -1090,7 +1120,7 @@ function New-DiscoveryAppRegistration {
         throw $decision.Message
     }
 
-    $payloadArgs = @{ DisplayName = $DisplayName; ManifestPath = $ManifestPath }
+    $payloadArgs = @{ DisplayName = $DisplayName; ManifestPath = $ManifestPath; ConsentRedirectUri = $ConsentRedirectUri }
     if ($NoKeyCredential) {
         # ClientSecret mode: no keyCredential at creation; cert inputs not consulted.
         $payloadArgs['NoKeyCredential'] = $true
@@ -1120,6 +1150,7 @@ function New-DiscoveryAppRegistration {
             TenantId           = $whatIfTenant
             DisplayName        = $DisplayName
             Thumbprint         = $thumbprint
+            ConsentRedirectUri = $ConsentRedirectUri
             ConsentGranted     = $false
             WhatIf             = $true
         }
@@ -1146,6 +1177,7 @@ function New-DiscoveryAppRegistration {
         TenantId           = $tenantId
         DisplayName        = $DisplayName
         Thumbprint         = $thumbprint
+        ConsentRedirectUri = $ConsentRedirectUri
         ConsentGranted     = $false
     }
 }

@@ -187,6 +187,21 @@ Describe 'App-registration pure logic (Tier A)' {
             @($p.requiredResourceAccess).Count | Should -Be 1
             @($p.requiredResourceAccess[0].resourceAccess).Count | Should -Be 53
         }
+
+        It 'registers a consent redirect URI when supplied' {
+            $p = New-DiscoveryAppPayload -DisplayName 'Redirect App' -CertPath $script:CerPath `
+                -ConsentRedirectUri 'https://consent.example.test/entraid-discovery/complete'
+            $p.web | Should -Not -BeNullOrEmpty
+            @($p.web.redirectUris).Count | Should -Be 1
+            $p.web.redirectUris[0] | Should -BeExactly 'https://consent.example.test/entraid-discovery/complete'
+        }
+
+        It 'registers a consent redirect URI in the no-certificate payload' {
+            $p = New-DiscoveryAppPayload -DisplayName 'Redirect Secret App' -NoKeyCredential `
+                -ConsentRedirectUri 'https://consent.example.test/entraid-discovery/complete'
+            $p.ContainsKey('keyCredentials') | Should -BeFalse
+            $p.web.redirectUris[0] | Should -BeExactly 'https://consent.example.test/entraid-discovery/complete'
+        }
     }
 
     Context 'New-DiscoveryPasswordCredentialPayload (ClientSecret pathway)' {
@@ -584,6 +599,14 @@ Describe 'App-registration pure logic (Tier A)' {
         It 'consent URL falls back to common tenant when TenantId omitted' {
             $lines = Get-DiscoveryConsentInstructions -AppId 'a'
             ($lines -join "`n") | Should -Match 'login\.microsoftonline\.com/common/adminconsent'
+        }
+
+        It 'adds encoded redirect_uri and state when a consent redirect URI is supplied' {
+            $lines = Get-DiscoveryConsentInstructions -AppId 'app-1' -TenantId 'tid-1' `
+                -ConsentRedirectUri 'https://consent.example.test/entraid-discovery/complete'
+            $text = ($lines -join "`n")
+            $text | Should -Match 'client_id=app-1&redirect_uri=https%3A%2F%2Fconsent\.example\.test%2Fentraid-discovery%2Fcomplete'
+            $text | Should -Match 'state=proaxiom-entraid-discovery'
         }
     }
 }

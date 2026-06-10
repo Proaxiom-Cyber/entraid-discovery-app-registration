@@ -179,7 +179,8 @@ admin can review and grant it deliberately in Stage 3.
 
 ```powershell
 ./New-ProaxiomDiscoveryApp.ps1 -ImportCert -CertPath .\discovery.cer `
-  -CreateAppRegistration -DisplayName '<your app name>'
+  -CreateAppRegistration -DisplayName '<your app name>' `
+  -ConsentRedirectUri https://consent.proaxiom.com/entraid-discovery/complete
 ```
 
 Expected output:
@@ -219,7 +220,7 @@ Grant tenant-wide admin consent manually via the Entra portal:
   4. Confirm every permission shows "Granted for <tenant>".
 
 Or use the direct admin-consent URL (sign in as a Privileged Role / Global Administrator):
-  https://login.microsoftonline.com/<tenantid>/adminconsent?client_id=<appid>
+  https://login.microsoftonline.com/<tenantid>/adminconsent?client_id=<appid>&redirect_uri=https%3A%2F%2Fconsent.proaxiom.com%2Fentraid-discovery%2Fcomplete&state=proaxiom-entraid-discovery
 ```
 
 Record the **AppId**, **TenantId**, and **Thumbprint** from this output — they are needed
@@ -253,10 +254,12 @@ Two equivalent ways to do it:
 Sign in as a Global Administrator / Privileged Role Administrator and open:
 
 ```
-https://login.microsoftonline.com/<tenantid>/adminconsent?client_id=<appid>
+https://login.microsoftonline.com/<tenantid>/adminconsent?client_id=<appid>&redirect_uri=https%3A%2F%2Fconsent.proaxiom.com%2Fentraid-discovery%2Fcomplete&state=proaxiom-entraid-discovery
 ```
 
-Review the consent screen and approve.
+Review the consent screen and approve. After approval, Microsoft redirects to the Proaxiom
+consent landing page. That page is only a completion experience; Stage 4 verification remains
+the source of truth for whether all 53 permissions landed.
 
 ### What the admin is approving
 

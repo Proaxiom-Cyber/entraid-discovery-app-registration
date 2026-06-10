@@ -1,0 +1,6 @@
+name = "entraid-discovery-consent-redirect"
+main = "worker.mjs"
+compatibility_date = "2026-06-01"
+
+[observability]
+enabled = true

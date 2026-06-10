@@ -171,6 +171,7 @@ Describe 'New-ProaxiomDiscoveryApp.ps1 parameter surface' {
             @{ param = 'CreateAppRegistration' }
             @{ param = 'AppObjectId' }
             @{ param = 'GrantConsent' }
+            @{ param = 'ConsentRedirectUri' }
             @{ param = 'DisplayName' }
             @{ param = 'TestNaming' }
             @{ param = 'TenantId' }
@@ -187,6 +188,7 @@ Describe 'New-ProaxiomDiscoveryApp.ps1 parameter surface' {
             @{ param = 'CreateAppRegistration' }
             @{ param = 'AppObjectId' }
             @{ param = 'GrantConsent' }
+            @{ param = 'ConsentRedirectUri' }
             @{ param = 'ForceNewApp' }
         ) {
             # A parameter with no ParameterSetName-specific attribute binds to all
@@ -204,6 +206,14 @@ Describe 'New-ProaxiomDiscoveryApp.ps1 parameter surface' {
             $script:Parameters['GrantConsent'].ParameterType | Should -Be ([switch])
         }
 
+        It '-ConsentRedirectUri is an HTTPS string' {
+            $script:Parameters['ConsentRedirectUri'].ParameterType | Should -Be ([string])
+            $pattern = $script:Parameters['ConsentRedirectUri'].Attributes |
+                Where-Object { $_ -is [System.Management.Automation.ValidatePatternAttribute] } |
+                Select-Object -First 1
+            $pattern.RegexPattern | Should -BeExactly '^https://'
+        }
+
         It '-TestNaming is a switch' {
             $script:Parameters['TestNaming'].ParameterType | Should -Be ([switch])
         }
@@ -218,6 +228,11 @@ Describe 'New-ProaxiomDiscoveryApp.ps1 parameter surface' {
         It 'rejects -GrantConsent without -CreateAppRegistration' {
             { & $script:ScriptPath -AppObjectId 'obj-1' -GrantConsent -WhatIf -ErrorAction Stop } |
                 Should -Throw -ExpectedMessage '*GrantConsent*'
+        }
+
+        It 'rejects -ConsentRedirectUri without -CreateAppRegistration' {
+            { & $script:ScriptPath -AppObjectId 'obj-1' -ConsentRedirectUri 'https://consent.example.test/complete' -WhatIf -ErrorAction Stop } |
+                Should -Throw -ExpectedMessage '*ConsentRedirectUri*CreateAppRegistration*'
         }
     }
 

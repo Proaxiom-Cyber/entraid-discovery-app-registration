@@ -96,6 +96,11 @@ function Get-DiscoveryConsentInstructions {
         The tenant id used to build the admin-consent URL. Optional; 'common' is
         used when omitted (still functional, prompts for tenant selection).
 
+    .PARAMETER ConsentRedirectUri
+        Optional registered reply URL. When supplied, the direct admin-consent
+        URL includes redirect_uri so Microsoft returns to the controlled landing
+        page instead of showing AADSTS500113 after consent.
+
     .OUTPUTS
         System.String[]
     #>
@@ -110,13 +115,23 @@ function Get-DiscoveryConsentInstructions {
         [Parameter()]
         [AllowNull()]
         [AllowEmptyString()]
-        [string]$TenantId
+        [string]$TenantId,
+
+        [Parameter()]
+        [AllowNull()]
+        [AllowEmptyString()]
+        [string]$ConsentRedirectUri
     )
 
     $appToken    = if ([string]::IsNullOrWhiteSpace($AppId))    { '<appid>' } else { $AppId }
     $tenantToken = if ([string]::IsNullOrWhiteSpace($TenantId)) { 'common' } else { $TenantId }
 
     $consentUrl = "https://login.microsoftonline.com/$tenantToken/adminconsent?client_id=$appToken"
+    if (-not [string]::IsNullOrWhiteSpace($ConsentRedirectUri)) {
+        $encodedRedirect = [System.Uri]::EscapeDataString($ConsentRedirectUri)
+        $encodedState = [System.Uri]::EscapeDataString('proaxiom-entraid-discovery')
+        $consentUrl = "$consentUrl&redirect_uri=$encodedRedirect&state=$encodedState"
+    }
 
     @(
         'Admin consent was NOT granted (consent is opt-in; re-run with -GrantConsent to automate it).'
@@ -142,6 +157,9 @@ function Format-DiscoveryConsentInstructions {
     .PARAMETER TenantId
         The tenant id used to build the admin-consent URL. Optional.
 
+    .PARAMETER ConsentRedirectUri
+        Optional registered reply URL to include in the direct admin-consent URL.
+
     .OUTPUTS
         None. Writes to the host only.
     #>
@@ -156,10 +174,15 @@ function Format-DiscoveryConsentInstructions {
         [Parameter()]
         [AllowNull()]
         [AllowEmptyString()]
-        [string]$TenantId
+        [string]$TenantId,
+
+        [Parameter()]
+        [AllowNull()]
+        [AllowEmptyString()]
+        [string]$ConsentRedirectUri
     )
 
-    $lines = Get-DiscoveryConsentInstructions -AppId $AppId -TenantId $TenantId
+    $lines = Get-DiscoveryConsentInstructions -AppId $AppId -TenantId $TenantId -ConsentRedirectUri $ConsentRedirectUri
     Write-Host ''
     Write-Host 'Admin consent required' -ForegroundColor Yellow
     Write-Host '----------------------'
@@ -396,6 +419,7 @@ function Format-DiscoveryAppResult {
     $tenantId   = [string](& $getProp 'TenantId')
     $thumbprint = [string](& $getProp 'Thumbprint')
     $display    = [string](& $getProp 'DisplayName')
+    $redirectUri = [string](& $getProp 'ConsentRedirectUri')
 
     $consentRaw     = & $getProp 'ConsentGranted'
     $consentGranted = if ($null -eq $consentRaw) { $false } else { [bool]$consentRaw }
@@ -418,7 +442,7 @@ function Format-DiscoveryAppResult {
     }
 
     if (-not $consentGranted) {
-        Format-DiscoveryConsentInstructions -AppId $appId -TenantId $tenantId
+        Format-DiscoveryConsentInstructions -AppId $appId -TenantId $tenantId -ConsentRedirectUri $redirectUri
     }
 }
 
