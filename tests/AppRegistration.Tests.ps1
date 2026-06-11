@@ -461,7 +461,12 @@ Describe 'App-registration pure logic (Tier A)' {
         }
     }
 
-    Context 'Invoke-DiscoveryGraphDelete idempotent delete semantics' {
+    Context 'Invoke-DiscoveryGraphDelete LEGACY (no -VerifyScriptBlock) delete semantics' {
+
+        # Legacy mode is deprecated (it trusts Graph DELETE status codes, which lie)
+        # but its semantics are preserved for back-compat; these tests pin them.
+        # -WarningAction SilentlyContinue suppresses the deprecation warning, which
+        # has its own test in the read-verified Context below.
 
         BeforeAll {
             $script:AppRegModule = Get-Module AppRegistration
@@ -469,14 +474,14 @@ Describe 'App-registration pure logic (Tier A)' {
 
         It 'returns $true on a clean delete' {
             & $script:AppRegModule {
-                Invoke-DiscoveryGraphDelete -OperationName 'clean' -ScriptBlock { }
+                Invoke-DiscoveryGraphDelete -OperationName 'clean' -WarningAction SilentlyContinue -ScriptBlock { }
             } | Should -BeTrue
         }
 
         It 'treats a 404 from the delete as success WITHOUT retrying' {
             & $script:AppRegModule {
                 $script:__delCalls = 0
-                $r = Invoke-DiscoveryGraphDelete -OperationName '404' -ScriptBlock {
+                $r = Invoke-DiscoveryGraphDelete -OperationName '404' -WarningAction SilentlyContinue -ScriptBlock {
                     $script:__delCalls++
                     throw 'Status: 404 (NotFound) Request_ResourceNotFound'
                 }
@@ -487,12 +492,127 @@ Describe 'App-registration pure logic (Tier A)' {
         It 're-throws a permanent (403 authz) delete error' {
             & $script:AppRegModule {
                 $script:__delCalls = 0
-                { Invoke-DiscoveryGraphDelete -OperationName 'authz' -ScriptBlock {
+                { Invoke-DiscoveryGraphDelete -OperationName 'authz' -WarningAction SilentlyContinue -ScriptBlock {
                     $script:__delCalls++
                     throw 'Status: 403 (Forbidden) Authorization_RequestDenied'
                 } } | Should -Throw
                 $script:__delCalls
             } | Should -Be 1
+        }
+    }
+
+    Context 'Invoke-DiscoveryGraphDelete READ-VERIFIED deletion (DELETE statuses are not trusted)' {
+
+        # Live finding (2026-06-11, TierB-validation-evidence.md "Path A redirect
+        # retest"): Graph DELETE status codes lie in BOTH directions on app/SP
+        # deletes -- a 404 was returned for objects that still existed (silent
+        # orphans), and a success status left the object readable. With
+        # -VerifyScriptBlock, deletion is reported ONLY when a verification read
+        # throws not-found. These tests drive the wrapper's own control flow with
+        # plain closures over module-scoped counters (no Graph cmdlets, no tenant);
+        # -DelaysOverride 0 makes the bounded retry loop sleep-free.
+
+        BeforeAll {
+            $script:AppRegModule = Get-Module AppRegistration
+        }
+
+        It 'happy path: clean DELETE + verify read 404s on the first try -> $true with a single delete' {
+            & $script:AppRegModule {
+                $script:__rvDel = 0
+                $script:__rvVer = 0
+                $r = Invoke-DiscoveryGraphDelete -OperationName 'rv-happy' -DelaysOverride 0 -ScriptBlock {
+                    $script:__rvDel++
+                } -VerifyScriptBlock {
+                    $script:__rvVer++
+                    throw 'Status: 404 (NotFound) Request_ResourceNotFound'
+                }
+                "$r/$script:__rvDel/$script:__rvVer"
+            } | Should -BeExactly 'True/1/1'
+        }
+
+        It 'does NOT trust a successful DELETE: re-deletes while the read still sees the object, $true once it 404s' {
+            & $script:AppRegModule {
+                $script:__rvDel = 0
+                $script:__rvVer = 0
+                $r = Invoke-DiscoveryGraphDelete -OperationName 'rv-lag' -DelaysOverride 0 -ScriptBlock {
+                    $script:__rvDel++   # the DELETE claims success every time
+                } -VerifyScriptBlock {
+                    $script:__rvVer++
+                    if ($script:__rvVer -le 2) { return [pscustomobject]@{ Id = 'still-here' } }
+                    throw 'Status: 404 (NotFound) Request_ResourceNotFound'
+                }
+                "$r/$script:__rvDel/$script:__rvVer"
+            } | Should -BeExactly 'True/3/3'
+        }
+
+        It 'does NOT trust a 404 from the DELETE: keeps re-deleting, then THROWS when the object never disappears' {
+            & $script:AppRegModule {
+                $script:__rvDel = 0
+                $script:__rvVer = 0
+                { Invoke-DiscoveryGraphDelete -OperationName 'rv-orphan' -MaxAttempts 3 -DelaysOverride 0 -ScriptBlock {
+                    $script:__rvDel++
+                    throw 'Status: 404 (NotFound) Request_ResourceNotFound'   # the lying 404 (live finding)
+                } -VerifyScriptBlock {
+                    $script:__rvVer++
+                    [pscustomobject]@{ Id = 'still-here' }   # object remains readable forever
+                } } | Should -Throw -ExpectedMessage '*NOT verified*'
+                "$script:__rvDel/$script:__rvVer"
+            } | Should -BeExactly '3/3'
+        }
+
+        It 'throws immediately on a permanent (403 authz) error from the verification read' {
+            & $script:AppRegModule {
+                $script:__rvDel = 0
+                { Invoke-DiscoveryGraphDelete -OperationName 'rv-authz' -MaxAttempts 5 -DelaysOverride 0 -ScriptBlock {
+                    $script:__rvDel++
+                } -VerifyScriptBlock {
+                    throw 'Status: 403 (Forbidden) Authorization_RequestDenied'
+                } } | Should -Throw
+                $script:__rvDel
+            } | Should -Be 1
+        }
+
+        It 'retries a transiently-failing verification read WITHOUT re-running the delete' {
+            & $script:AppRegModule {
+                $script:__rvDel = 0
+                $script:__rvVer = 0
+                $r = Invoke-DiscoveryGraphDelete -OperationName 'rv-flaky-verify' -DelaysOverride 0 -ScriptBlock {
+                    $script:__rvDel++
+                } -VerifyScriptBlock {
+                    $script:__rvVer++
+                    if ($script:__rvVer -eq 1) { throw 'Status: 503 ServiceUnavailable' }
+                    throw 'Status: 404 (NotFound) Request_ResourceNotFound'
+                }
+                "$r/$script:__rvDel/$script:__rvVer"
+            } | Should -BeExactly 'True/1/2'
+        }
+
+        It 'without -VerifyScriptBlock keeps legacy semantics but emits a deprecation warning' {
+            $merged = & $script:AppRegModule {
+                Invoke-DiscoveryGraphDelete -OperationName 'rv-legacy' -ScriptBlock {
+                    throw 'Status: 404 (NotFound) Request_ResourceNotFound'
+                } 3>&1
+            }
+            $warnings = @($merged | Where-Object { $_ -is [System.Management.Automation.WarningRecord] })
+            $warnings.Count | Should -BeGreaterOrEqual 1
+            (($warnings | ForEach-Object { $_.Message }) -join ' ') | Should -Match 'UNVERIFIED deletes are DEPRECATED'
+            @($merged | Where-Object { $_ -is [bool] }) | Should -Contain $true
+        }
+
+        It 'Remove-DiscoveryAppRegistration supplies verification reads for BOTH deletes (source-level)' {
+            $moduleText = Get-Content -LiteralPath (Join-Path (Join-Path $script:RepoRoot 'src') 'AppRegistration.psm1') -Raw
+            $spVerified = [regex]::Match(
+                $moduleText,
+                'Remove-MgServicePrincipal\s+-ServicePrincipalId\s+\$spId\s+-ErrorAction\s+Stop(?s).*?-VerifyScriptBlock(?s).*?Get-MgServicePrincipal\s+-ServicePrincipalId\s+\$spId\s+-ErrorAction\s+Stop'
+            )
+            $appVerified = [regex]::Match(
+                $moduleText,
+                'Remove-MgApplication\s+-ApplicationId\s+\$appObjId\s+-ErrorAction\s+Stop(?s).*?-VerifyScriptBlock(?s).*?Get-MgApplication\s+-ApplicationId\s+\$appObjId\s+-ErrorAction\s+Stop'
+            )
+            $spVerified.Success | Should -BeTrue `
+                -Because 'the SP delete must be read-verified (teardown is the customer decommission path)'
+            $appVerified.Success | Should -BeTrue `
+                -Because 'the application delete must be read-verified (live 404s silently orphaned apps)'
         }
     }
 

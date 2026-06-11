@@ -23,7 +23,7 @@
       * New-DiscoveryAppClientSecret       - add a Graph-generated client secret
                                              (ClientSecret mode; SecureString-only result)
       * Grant-DiscoveryAdminConsent        - app-role assignments on the SP (FR 14)
-      * Remove-DiscoveryAppRegistration    - teardown app + SP (3.5)
+      * Remove-DiscoveryAppRegistration    - teardown app + SP, read-verified (3.5)
 
     The Microsoft.Graph SDK is imported LAZILY inside each wrapper (not at module
     load) so this module imports and its builders unit-test on macOS PowerShell 7
@@ -48,6 +48,15 @@
       New-MgServicePrincipalAppRoleAssignment  | Grant-DiscoveryAdminConsent    | -GrantConsent
       Remove-MgServicePrincipal                | Remove-DiscoveryAppRegistration| (teardown — integration tier only)
       Remove-MgApplication                     | Remove-DiscoveryAppRegistration| (teardown — integration tier only)
+
+    Teardown deletes are READ-VERIFIED (2026-06-11 hardening): live runs showed
+    Graph DELETE status codes are unreliable in both directions (a 404 can hide a
+    still-existing object; a success status can leave the object readable), so
+    Remove-DiscoveryAppRegistration reports a removal ONLY after a verification
+    read (Get-MgServicePrincipal / Get-MgApplication) confirms the object is gone
+    — otherwise it re-deletes within a bounded budget and then THROWS, never
+    claiming success on status codes alone (Invoke-DiscoveryGraphDelete
+    -VerifyScriptBlock).
 
     Connect-DiscoveryGraph performs an interactive sign-in only (no tenant write)
     and requests ONLY the minimum scopes: Application.ReadWrite.All,
@@ -379,37 +388,80 @@ function Test-DiscoveryNotFoundGraphError {
 function Invoke-DiscoveryGraphDelete {
     <#
     .SYNOPSIS
-        Runs a Graph DELETE scriptblock idempotently: 404/ResourceNotFound is treated
-        as SUCCESS (already gone); other transient errors are retried; permanent
-        errors (e.g. 403 authz) throw.
+        Runs a Graph DELETE scriptblock with READ-VERIFIED completion: deletion is
+        reported ONLY when a follow-up verification read says the object is gone.
+        Without -VerifyScriptBlock (legacy mode, DEPRECATED) it falls back to
+        status-code semantics and warns.
 
     .DESCRIPTION
-        Teardown must be idempotent and robust against a transient Graph delete quirk
-        where Remove-Mg* can return 404/Request_ResourceNotFound for an object that
-        still exists (or has just been removed). For a DELETE:
+        Live integration runs (2026-06-11) showed Graph DELETE status codes are
+        unreliable in BOTH directions on application / service-principal deletes:
 
-          * 404 / ResourceNotFound  -> already gone, return SUCCESS (do NOT retry,
-            do NOT throw). This is checked FIRST, so the not-found case never burns the
-            retry budget (Test-DiscoveryTransientGraphError treats 404 as transient,
-            which is correct for create/resolve but wrong for delete).
-          * other transient errors  -> retried with bounded incremental backoff
-            (Test-DiscoveryTransientGraphError, minus the 404 family handled above).
-          * permanent errors (403 authz, etc.) -> thrown clearly.
+          * a DELETE can return 404/Request_ResourceNotFound while the object STILL
+            EXISTS (trusting that as "already gone" silently orphaned two apps); and
+          * a DELETE can return success while the object is still readable seconds
+            later.
 
-        This uses its own bounded retry loop (rather than Invoke-DiscoveryGraphWithRetry)
-        so the 404 family can be reclassified as success per-attempt without the
-        transient classifier looping on it.
+        Teardown is the documented customer DECOMMISSION path, so claiming success
+        while an app + credential remain live is a security defect. With
+        -VerifyScriptBlock supplied (both internal call sites supply it), each
+        bounded attempt is:
 
-        Returns $true when the delete succeeded OR the object was already absent.
+          1. Run the DELETE, catching errors:
+               - permanent error (403 authz, etc.) -> throw immediately;
+               - success, 404/ResourceNotFound, or transient error -> the claimed
+                 outcome is NOT trusted either way; fall through to step 2.
+          2. Run the verification read:
+               - read throws not-found  -> object verified gone -> return $true
+                                           (the ONLY success path);
+               - read succeeds          -> object still readable -> NOT deleted ->
+                                           re-issue the DELETE on the next attempt,
+                                           regardless of what the DELETE claimed;
+               - read throws permanent  -> throw (cannot confirm deletion);
+               - read throws transient  -> retry the verification on the next
+                                           attempt WITHOUT re-running the DELETE.
+
+        Bounded and fail-closed: at most -MaxAttempts iterations (each at most one
+        DELETE + one verification read) with the same incremental backoff schedule
+        as Invoke-DiscoveryGraphWithRetry (worst case well under ~2 minutes). If the
+        budget is exhausted without the object being verified gone, this THROWS --
+        it never reports success on status codes alone.
+
+        LEGACY MODE (no -VerifyScriptBlock): retains the old idempotent semantics
+        (404 -> success without retry, transient -> bounded delete retry, permanent
+        -> throw) but emits a deprecation Write-Warning, because those semantics
+        were shown live to mis-report deletions. The legacy path exists only as a
+        back-compat defence for external callers.
 
     .PARAMETER ScriptBlock
         The delete operation (e.g. { Remove-MgApplication -ApplicationId $id -ErrorAction Stop }).
 
+    .PARAMETER VerifyScriptBlock
+        A read targeting the deleted object that THROWS not-found once it is gone
+        (e.g. { Get-MgApplication -ApplicationId $id -ErrorAction Stop }). Deletion
+        is reported ONLY when this read throws a 404/ResourceNotFound-class error
+        (Test-DiscoveryNotFoundGraphError). Use -ErrorAction Stop inside it so
+        not-found surfaces as a catchable terminating error; a read that silently
+        returns nothing is treated as "still readable" (fail-closed).
+
     .PARAMETER OperationName
         Human-readable name for log/throw messages.
 
+    .PARAMETER MaxAttempts
+        Maximum loop iterations, each at most one DELETE + one verification read.
+        Default 8.
+
+    .PARAMETER MaxDelaySeconds
+        Cap on a single backoff sleep. Default 13.
+
+    .PARAMETER DelaysOverride
+        TEST-ONLY: replaces the backoff schedule (seconds per attempt) so Tier-A
+        tests can exercise the retry control flow sleep-free (e.g. -DelaysOverride 0).
+        Production callers must not use this.
+
     .OUTPUTS
-        System.Boolean ($true = removed or already absent).
+        System.Boolean ($true = deletion verified by read; legacy mode: removed or
+        already absent per status code).
     #>
     [CmdletBinding()]
     [OutputType([bool])]
@@ -419,60 +471,152 @@ function Invoke-DiscoveryGraphDelete {
         [scriptblock]$ScriptBlock,
 
         [Parameter()]
+        [AllowNull()]
+        [scriptblock]$VerifyScriptBlock,
+
+        [Parameter()]
         [ValidateNotNullOrEmpty()]
-        [string]$OperationName = 'Graph delete'
+        [string]$OperationName = 'Graph delete',
+
+        [Parameter()]
+        [ValidateRange(1, 50)]
+        [int]$MaxAttempts = 8,
+
+        [Parameter()]
+        [ValidateRange(1, 120)]
+        [int]$MaxDelaySeconds = 13,
+
+        [Parameter()]
+        [AllowNull()]
+        [int[]]$DelaysOverride
     )
 
     # Bounded incremental backoff, mirroring Invoke-DiscoveryGraphWithRetry's schedule
-    # (kept self-contained so the 404-as-success reclassification happens per attempt
-    # without the transient classifier looping on a 404). Capped at MaxDelaySeconds.
-    $maxAttempts     = 8
-    $maxDelaySeconds = 13
-    $delays          = @(2, 3, 5, 8, 13, 21, 34, 55)
-
-    $attempt   = 0
-    $lastError = $null
-
-    while ($attempt -lt $maxAttempts) {
-        $attempt++
-        try {
-            & $ScriptBlock | Out-Null
-            return $true
-        }
-        catch {
-            $lastError = $_
-
-            # 404 / ResourceNotFound on a DELETE means already gone -> success.
-            # Checked FIRST so a 404 is never retried (the transient classifier would).
-            if (Test-DiscoveryNotFoundGraphError -ErrorRecord $_) {
-                Write-Verbose ("${OperationName}: target already absent (404/ResourceNotFound) -- treating as success.")
-                return $true
-            }
-
-            # Non-404 permanent error (e.g. 403 authz) -> fail fast.
-            if (-not (Test-DiscoveryTransientGraphError -ErrorRecord $_)) {
-                throw
-            }
-
-            if ($attempt -ge $maxAttempts) {
-                break
-            }
-
-            $idx = $attempt - 1
-            if ($idx -ge $delays.Count) { $idx = $delays.Count - 1 }
-            $sleep = $delays[$idx]
-            if ($sleep -gt $maxDelaySeconds) { $sleep = $maxDelaySeconds }
-
-            Write-Verbose ("${OperationName} attempt $attempt/$maxAttempts failed with a transient Graph error; " +
-                           "retrying in ${sleep}s. Detail: " + [string]$_)
-            Start-Sleep -Seconds $sleep
-        }
+    # (kept self-contained so DELETE outcomes can be reclassified per attempt without
+    # the transient classifier looping on a 404). Capped at MaxDelaySeconds.
+    $delays = @(2, 3, 5, 8, 13, 21, 34, 55)
+    if ($null -ne $DelaysOverride -and @($DelaysOverride).Count -gt 0) {
+        # Test-only override so Tier-A tests can drive the control flow sleep-free.
+        $delays = $DelaysOverride
     }
 
+    $verified = ($null -ne $VerifyScriptBlock)
+    if (-not $verified) {
+        Write-Warning ("${OperationName}: called without -VerifyScriptBlock. UNVERIFIED deletes are DEPRECATED -- " +
+                       'Graph DELETE status codes are unreliable in both directions (a 404 can hide a live object; ' +
+                       'a success status can leave it readable). Supply -VerifyScriptBlock so deletion is confirmed by a read.')
+    }
+
+    $attempt     = 0
+    $lastError   = $null
+    $lastOutcome = $null
+    $needDelete  = $true   # verified mode: a transient verify error re-checks the read without re-deleting
+
+    while ($attempt -lt $MaxAttempts) {
+        $attempt++
+
+        if ($needDelete) {
+            try {
+                & $ScriptBlock | Out-Null
+                if (-not $verified) {
+                    # Legacy mode trusts the DELETE's success status.
+                    return $true
+                }
+            }
+            catch {
+                $lastError = $_
+
+                if (Test-DiscoveryNotFoundGraphError -ErrorRecord $_) {
+                    # 404 / ResourceNotFound from the DELETE. Legacy mode trusts it
+                    # as already-gone. Verified mode does NOT (live runs returned 404
+                    # for objects that still existed) -- fall through to the read.
+                    if (-not $verified) {
+                        Write-Verbose ("${OperationName}: target already absent (404/ResourceNotFound) -- treating as success.")
+                        return $true
+                    }
+                }
+                elseif (-not (Test-DiscoveryTransientGraphError -ErrorRecord $_)) {
+                    # Permanent error (e.g. 403 authz) -> fail fast in BOTH modes.
+                    throw
+                }
+                elseif (-not $verified) {
+                    # Legacy transient handling: bounded sleep + retry the delete.
+                    if ($attempt -ge $MaxAttempts) { break }
+                    $idx = $attempt - 1
+                    if ($idx -ge $delays.Count) { $idx = $delays.Count - 1 }
+                    $sleep = $delays[$idx]
+                    if ($sleep -gt $MaxDelaySeconds) { $sleep = $MaxDelaySeconds }
+                    if ($sleep -lt 0) { $sleep = 0 }
+                    Write-Verbose ("${OperationName} attempt $attempt/$MaxAttempts failed with a transient Graph error; " +
+                                   "retrying in ${sleep}s. Detail: " + [string]$_)
+                    Start-Sleep -Seconds $sleep
+                    continue
+                }
+                # Verified mode + (404 or transient): the DELETE's claimed outcome
+                # is not trusted either way -- proceed to the verification read.
+            }
+        }
+
+        if ($verified) {
+            # The verification read is the ONLY authority on whether the delete
+            # actually completed -- regardless of what the DELETE claimed above.
+            $stillReadable = $false
+            try {
+                & $VerifyScriptBlock | Out-Null
+                # Read succeeded -> the object is still readable -> NOT deleted.
+                $stillReadable = $true
+            }
+            catch {
+                if (Test-DiscoveryNotFoundGraphError -ErrorRecord $_) {
+                    # The ONLY success path: a read says the object is gone.
+                    Write-Verbose ("${OperationName}: deletion VERIFIED by read (object not found).")
+                    return $true
+                }
+                if (-not (Test-DiscoveryTransientGraphError -ErrorRecord $_)) {
+                    # Permanent verify failure (e.g. authz): cannot confirm -> throw.
+                    throw
+                }
+                # Transient verify error -> retry the verification on the next
+                # attempt WITHOUT re-running the delete.
+                $lastError   = $_
+                $lastOutcome = 'the verification read kept failing transiently'
+                $needDelete  = $false
+                Write-Verbose ("${OperationName} attempt $attempt/${MaxAttempts}: verification read failed transiently; " +
+                               'will re-verify. Detail: ' + [string]$_)
+            }
+
+            if ($stillReadable) {
+                # Whatever the DELETE claimed (success or 404), a read still sees
+                # the object -> it is NOT deleted -> re-issue the DELETE.
+                $lastOutcome = 'a verification read still sees the object'
+                $needDelete  = $true
+                Write-Verbose ("${OperationName} attempt $attempt/${MaxAttempts}: verification read still sees the object " +
+                               '-- re-issuing the delete.')
+            }
+        }
+
+        if ($attempt -ge $MaxAttempts) { break }
+
+        $idx = $attempt - 1
+        if ($idx -ge $delays.Count) { $idx = $delays.Count - 1 }
+        $sleep = $delays[$idx]
+        if ($sleep -gt $MaxDelaySeconds) { $sleep = $MaxDelaySeconds }
+        if ($sleep -lt 0) { $sleep = 0 }
+        Start-Sleep -Seconds $sleep
+    }
+
+    # Budget exhausted without a verified deletion -> THROW. Never report success.
     $detail = ''
-    if ($null -ne $lastError) { $detail = [string]$lastError }
-    throw ("${OperationName} did not succeed after $maxAttempts attempts (transient Graph errors " +
-           "persisted beyond the retry budget). Last error: $detail")
+    if ($null -ne $lastError) { $detail = ' Last error: ' + [string]$lastError }
+    if ($verified) {
+        $why = 'the object was never verified gone'
+        if (-not [string]::IsNullOrEmpty($lastOutcome)) { $why = $lastOutcome }
+        throw ("${OperationName}: deletion NOT verified after $MaxAttempts attempts -- $why. " +
+               'Graph DELETE status codes are not trusted; refusing to report success while the object ' +
+               "may still exist.$detail")
+    }
+    throw ("${OperationName} did not succeed after $MaxAttempts attempts (transient Graph errors " +
+           "persisted beyond the retry budget).$detail")
 }
 
 function Assert-GraphModuleAvailable {
@@ -1487,8 +1631,17 @@ function Remove-DiscoveryAppRegistration {
     .DESCRIPTION
         Removes the application (and its service principal) created for an
         integration run. Consumed by the live integration tier to clean up
-        zzTEST-DiscoveryApp-<timestamp> apps. Honours ShouldProcess. Tolerant: a
-        missing app/SP is treated as already-removed rather than an error.
+        zzTEST-DiscoveryApp-<timestamp> apps, and is the documented customer
+        DECOMMISSION path. Honours ShouldProcess. Tolerant: a missing app/SP is
+        treated as already-removed rather than an error.
+
+        Deletions are READ-VERIFIED (2026-06-11 hardening): Graph DELETE status
+        codes are not trusted -- each delete passes a -VerifyScriptBlock read to
+        Invoke-DiscoveryGraphDelete, and a removal is reported ONLY once that read
+        says the object is gone (bounded re-delete retries; THROWS if the object
+        remains readable when the budget is exhausted). The "already absent"
+        shortcuts below are pre-delete READS that returned not-found, i.e. the
+        same verified-gone signal.
 
         Requires Application.ReadWrite.All. Call Connect-DiscoveryGraph first.
 
@@ -1534,39 +1687,54 @@ function Remove-DiscoveryAppRegistration {
     $removedSp  = $false
     $removedApp = $false
 
-    # Delete the service principal first (by appId). A missing SP is already-removed
-    # (success). Transient delete quirks (incl. a 404 on an SP that still exists) are
-    # handled by Invoke-DiscoveryGraphDelete: 404 -> success, other transient ->
-    # retry, authz -> throw. So an absent SP is reported RemovedServicePrincipal=$true
-    # (idempotent: tearing down something already gone succeeds).
+    # Delete the service principal first (by appId). Deletion is READ-VERIFIED:
+    # Invoke-DiscoveryGraphDelete re-issues the DELETE until the -VerifyScriptBlock
+    # read says the SP is gone (live runs showed DELETE status codes lie in BOTH
+    # directions: a 404 on a live object, success with the object still readable),
+    # and THROWS if the budget is exhausted with the SP still readable. An absent
+    # SP is reported RemovedServicePrincipal=$true (idempotent teardown).
     if (-not [string]::IsNullOrWhiteSpace($clientId)) {
         $sp = Get-MgServicePrincipal -Filter "appId eq '$clientId'" -ErrorAction SilentlyContinue | Select-Object -First 1
         if ($null -eq $sp) {
-            # SP not present at all -> already absent -> idempotent success.
+            # SP not present at all -> already absent -> idempotent success. This
+            # shortcut is itself read-verified: the Get-MgServicePrincipal lookup
+            # above is a READ that returned not-found -- exactly the signal the
+            # -VerifyScriptBlock pathway trusts.
             $removedSp = $true
         }
         elseif ($PSCmdlet.ShouldProcess($sp.Id, 'Remove service principal')) {
             $spId = $sp.Id
             $removedSp = Invoke-DiscoveryGraphDelete -OperationName "remove service principal $spId" -ScriptBlock {
                 Remove-MgServicePrincipal -ServicePrincipalId $spId -ErrorAction Stop
+            } -VerifyScriptBlock {
+                # Deletion is trusted ONLY when this read throws not-found.
+                Get-MgServicePrincipal -ServicePrincipalId $spId -ErrorAction Stop
             }
         }
     }
 
-    # Delete the application. Same idempotent/robust delete semantics: a 404 from
-    # Remove-MgApplication (the observed transient quirk on an app that still exists)
-    # is treated as success, other transient errors are retried, authz throws.
+    # Delete the application. Same READ-VERIFIED semantics: a 404 from
+    # Remove-MgApplication is NOT trusted (the live quirk: 404 returned for an app
+    # that still existed, which previously orphaned it silently) -- only the
+    # verification read throwing not-found counts as removed; otherwise the delete
+    # is retried within the bounded budget and finally throws.
     if (-not [string]::IsNullOrWhiteSpace($objectId)) {
         if ($PSCmdlet.ShouldProcess($objectId, 'Remove application')) {
             $appObjId = $objectId
             $removedApp = Invoke-DiscoveryGraphDelete -OperationName "remove application $appObjId" -ScriptBlock {
                 Remove-MgApplication -ApplicationId $appObjId -ErrorAction Stop
+            } -VerifyScriptBlock {
+                # Deletion is trusted ONLY when this read throws not-found.
+                Get-MgApplication -ApplicationId $appObjId -ErrorAction Stop
             }
         }
     }
     elseif (-not [string]::IsNullOrWhiteSpace($clientId)) {
         # We had an appId but could not resolve an object id -> the application is
-        # already absent (could not be found). Idempotent success.
+        # already absent (could not be found). This shortcut is read-verified too:
+        # the resolve step above performed a Get-MgApplication READ that found
+        # nothing -- the same not-found signal the -VerifyScriptBlock pathway
+        # trusts. Idempotent success.
         $removedApp = $true
     }
 

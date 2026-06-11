@@ -2,5 +2,13 @@ name = "entraid-discovery-consent-redirect"
 main = "worker.mjs"
 compatibility_date = "2026-06-01"
 
+# Workers custom domain: custom_domain=true makes Cloudflare create/own the DNS
+# record + certificate for consent.proaxiom.com on the proaxiom.com zone at
+# deploy time, binding the whole hostname to this Worker (any path serves the
+# landing page; the documented path is /entraid-discovery/complete).
+routes = [
+  { pattern = "consent.proaxiom.com", custom_domain = true }
+]
+
 [observability]
 enabled = true

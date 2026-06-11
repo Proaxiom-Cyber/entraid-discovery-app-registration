@@ -25,6 +25,13 @@ cd cloudflare/consent-redirect-worker
 npx wrangler deploy
 ```
 
+`wrangler.toml` declares `consent.proaxiom.com` as a Workers **custom domain**
+(`custom_domain = true`), so the DNS record and certificate are provisioned
+automatically at deploy time — no manual DNS step. This requires the
+`proaxiom.com` zone to exist in the authenticated Cloudflare account. The first
+deploy needs authentication: run `npx wrangler login` (or set
+`CLOUDFLARE_API_TOKEN`).
+
 The Worker is stateless. It does not verify consent, store data, set cookies, or
 use secrets. Graph-side verification remains the source of truth for whether the
 53 Microsoft Graph application permissions landed.
