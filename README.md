@@ -47,14 +47,20 @@ give a credential that is both least-privilege and machine-bound:
    **Microsoft Platform Crypto Provider** (the TPM-backed CNG KSP), marked non-exportable.
    The key material is created inside the TPM and cannot be copied to another machine.
 
-```
-   ┌────────────────────────────┐         ┌──────────────────────────────┐
-   │ Windows 11 endpoint (TPM)  │         │ Microsoft Entra ID (tenant)  │
-   │                            │         │                              │
-   │  TPM ── private key ───────┼─ signs ─┤  app registration            │
-   │          (non-exportable)  │  JWT    │   └─ public cert (.cer)      │
-   │                            │ assert. │   └─ read-only Graph perms   │
-   └────────────────────────────┘         └──────────────────────────────┘
+```mermaid
+flowchart LR
+    subgraph endpoint["Windows 11 endpoint (TPM)"]
+        key["Private key<br/>TPM-bound, non-exportable"]
+    end
+    subgraph entra["Microsoft Entra ID (tenant)"]
+        app["App registration"]
+        cert["Public certificate (.cer)"]
+        perms["Read-only Graph permissions"]
+        app --- cert
+        app --- perms
+    end
+    key -- "signs JWT client assertion" --> app
+    app -- "validates signature, issues access token" --> key
 ```
 
 ### What the machine-lock actually guarantees (and what it doesn't)
