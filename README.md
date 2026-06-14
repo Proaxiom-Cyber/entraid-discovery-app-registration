@@ -22,10 +22,10 @@ endpoint. Engagements that cannot meet that bar can select a weaker credential p
 
 Two requirements shape the design:
 
-1. **Right-sized permissions.** Re-using a full incident-response audit app over-exposes the
-   customer (it can read mailboxes, Defender for Endpoint data, Purview, Teams, etc. — none
-   of which Phase 1 discovery needs). Starting from a broad app and *stripping back* is safer
-   than starting from a guessed-minimal set and finding it insufficient mid-engagement.
+1. **Right-sized permissions.** A general-purpose audit app over-exposes the customer. This
+   app requests exactly the read permissions the Phase 1 discovery runbook uses — each one
+   mapped to the runbook module that needs it — and nothing else: every permission is
+   read-only, and the set contains **no mailbox- or message-content permissions**.
 2. **Hardware-bound credential.** The customer gets assurance that the credential can only be
    used from a specific Windows 11 endpoint: the endpoint is provisioned, the private key is
    generated inside that machine's TPM and is non-exportable, and only the public certificate
@@ -165,7 +165,7 @@ steps layer on top as opt-in switches. All tenant-mutating steps honour
 | `-PfxPath <file>` | Path to a PFX/P12 bundle (certificate + **private key**) to install (`ImportPrivateKey` pathway only). The store copy is installed **non-exportable**; securely delete the source PFX (and every copy) after a successful import. |
 | `-PfxPassword <securestring>` | Password for `-PfxPath` as a **SecureString**. **Prompted interactively when omitted** (press Enter at the prompt for a password-less PFX); in non-interactive sessions an omitted password is treated as a password-less PFX. |
 | `-AcknowledgeReducedAssurance` | Explicit operator acknowledgement for the reduced-assurance pathways (`ImportPrivateKey`, `ClientSecret`). Without it, an interactive session is prompted and a non-interactive session **fails closed**. |
-| `-CreateAppRegistration` | Create a **new** app + service principal with the trimmed read-only permission set, embedding the public key as a `keyCredential` at creation (no separate upload step). Mutually exclusive with `-AppObjectId`. In `ClientSecret` mode the app is created with **no** certificate and a client secret is attached instead. |
+| `-CreateAppRegistration` | Create a **new** app + service principal with the 53-permission read-only manifest, embedding the public key as a `keyCredential` at creation (no separate upload step). Mutually exclusive with `-AppObjectId`. In `ClientSecret` mode the app is created with **no** certificate and a client secret is attached instead. |
 | `-AppObjectId <id>` | Attach the cert to an **existing** app registration instead of creating one. Mutually exclusive with `-CreateAppRegistration`. |
 | `-GrantConsent` | Grant tenant-wide admin consent programmatically (otherwise portal-consent instructions are printed). Only valid with `-CreateAppRegistration`. |
 | `-ConsentRedirectUri <https-url>` | Register an HTTPS reply URL on the new app and include it in the printed Path A admin-consent URL, so Microsoft returns to a controlled landing page instead of `AADSTS500113`. Only valid with `-CreateAppRegistration`. |
@@ -374,37 +374,34 @@ hardware (or an Azure Confidential VM, where the AK chains to an Azure CA — se
 
 ## Permission scoping
 
-Full detail and rationale: [`docs/reference/permissions.md`](docs/reference/permissions.md);
-the GUID-accurate, row-for-row operational view is
-[`manifests/permissions-companion.md`](manifests/permissions-companion.md) (mirrors
-`manifests/permissions.csv`). **These enumerated lists are the source of truth** for the
-permission set.
-
-The final set is **53** Microsoft Graph **application** (Role) permissions — all
+The set is **exactly 53** Microsoft Graph **application** (Role) permissions — all
 **read-only**, all against the Graph resource app
-(`00000003-0000-0000-c000-000000000000`). It is derived from a broad assessment permission
-set by cross-referencing the Phase 1 discovery runbook (modules 1.03–1.20):
+(`00000003-0000-0000-c000-000000000000`). Each permission is mapped to the Phase 1 discovery
+runbook module (1.03–1.20) that uses it, covering tenant configuration, users/groups,
+conditional access, auth methods, PIM, role assignments, app/SP inventory, identity
+governance, identity protection, device reads, external identities, audit/sign-in logs, and
+secure score.
 
-- **Keep (48)** — the read permissions the discovery modules actually use (tenant config,
-  users/groups, conditional access, auth methods, PIM, role assignments, app/SP inventory,
-  identity protection, device read, external identities, audit/sign-in logs, secure score).
-- **Add (5)** — read permissions the runbook needs that the broad app is *missing*:
-  `EntitlementManagement.Read.All`, `AccessReview.Read.All`, `LifecycleWorkflows.Read.All`,
-  `Agreement.Read.All`, `Reports.Read.All`. Without these, module 1.13 (identity governance)
-  fails its collection.
-- **Remove** — everything Phase 1 never touches: all Windows Defender ATP permissions, Backup
-  & Recovery, Information Protection/Purview, Teams, extra Intune detail, threat-intel,
-  **mailbox reading** (`Mail.Read`, `MailboxSettings.Read`), PKI, and miscellaneous.
+Properties of the set:
+
+- **Read-only.** Every permission is a Graph `*.Read*` application permission — no write
+  scopes, no action-invoking scopes.
+- **No mailbox- or message-content access.** Discovery reads directory configuration and
+  security posture, not user data content.
+- **Justified per module.** Every permission carries the runbook module(s) it serves and a
+  one-line justification — there are no "might need it" extras.
+
+The GUID-accurate, row-for-row reference — what each permission is for and which discovery
+module uses it — is
+[`manifests/permissions-companion.md`](manifests/permissions-companion.md) (mirrors
+`manifests/permissions.csv`, the machine-readable manifest the tool provisions from).
+**These enumerated lists are the source of truth** for the permission set.
 
 > **Delegated-only limitation:** `OnPremDirectorySynchronization.Read.All` (used in 1.17
 > Hybrid) is **delegated-only** — Microsoft Graph publishes no application (`Role`) variant —
 > so it **cannot be granted to this app-only client** and is intentionally **excluded** from
 > the manifest. The runbook treats the resulting HTTP 403 as an expected, documented
-> limitation and falls back to `Directory.Read.All` (which is in the keep set).
-
-Net effect: **53** permissions (48 keep + 5 add), dropping the most privacy-sensitive scope
-(mailbox content) while *closing* the governance/reporting gaps that would otherwise break
-module 1.13.
+> limitation and falls back to `Directory.Read.All` (which is in the set).
 
 ---
 
@@ -423,7 +420,7 @@ gate, not a command-line tag):
 
 | Tier | What it covers | When it runs |
 |------|----------------|--------------|
-| **Tier A — hardware/tenant-free** | Manifest schema/exclusions/additions/count, parameter-set and output-string checks. Runs anywhere in seconds; the regression net for manifest drift. | **Always** — on any host. |
+| **Tier A — hardware/tenant-free** | Manifest schema/content/count, parameter-set and output-string checks. Runs anywhere in seconds; the regression net for manifest drift. | **Always** — on any host. |
 | **Tier B — real TPM + live tenant** | Real Microsoft Platform Crypto Provider key generation, non-exportability, `.cer` export, `-GrantUser` ACL, `-Attest` mechanics, and the live app-registration → consent → token path. | **Only** on a Windows host with a TPM and a configured/reachable tenant; otherwise **Skipped**. |
 
 The Tier-B tests are **skip-gated, not tag-gated** — there is nothing to pass on the command
@@ -452,7 +449,6 @@ entraid-discovery-app/
 └── docs/
     ├── customer-provisioning-runbook.md  # step-by-step provisioning walkthrough
     └── reference/
-        ├── permissions.md            # keep / remove / add tables + rationale
         ├── credential-modes.md       # the five -CredentialMode pathways + acknowledgement gate
         └── attestation.md            # -Attest behaviour + assurance limitations
 ```

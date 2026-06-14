@@ -171,7 +171,7 @@ Keep `discovery.cer`. You will pass it to Stage 2.
 
 Run on the same workstation, signed in interactively as an Application Administrator /
 Cloud Application Administrator. This creates a **new** app registration and service
-principal carrying the trimmed read-only permission set, embedding the public certificate
+principal carrying the 53-permission read-only set, embedding the public certificate
 as the app's credential **at creation** — there is no separate upload step.
 
 Note there is **no `-GrantConsent`** here: the app is created *without* consent, so an
@@ -270,10 +270,9 @@ write permissions, no action-invoking scopes, and no mailbox-content access**.
 
 The complete, GUID-accurate list — what each permission is for and which discovery module
 uses it — is in the permission manifest companion:
-[`manifests/permissions-companion.md`](../manifests/permissions-companion.md). The set is
-**53** permissions: **48 kept** from the broad assessment app (only the reads Phase 1
-discovery actually uses) plus **5 added** governance/reporting reads. See
-[`docs/reference/permissions.md`](reference/permissions.md) for the full derivation.
+[`manifests/permissions-companion.md`](../manifests/permissions-companion.md): **53**
+permissions, each mapped to the Phase 1 discovery runbook module (1.03–1.20) that uses it,
+with a per-permission justification.
 
 The consent is granted **in your tenant**, and you retain full control: you can revoke it
 at any time (see [Stage 5](#stage-5--decommission)).

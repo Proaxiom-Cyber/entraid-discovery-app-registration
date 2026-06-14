@@ -221,7 +221,7 @@ param(
 
     # --- App registration (Task 3.0, FR 12-15) ---
 
-    # Create a NEW application + service principal with the trimmed manifest,
+    # Create a NEW application + service principal with the read-only permission manifest,
     # embedding the public cert as a keyCredential at creation (FR 12). Usable
     # after generating (GenerateLocal) or importing (ImportCert) a cert. In
     # ClientSecret mode the application is created with NO keyCredential and a
