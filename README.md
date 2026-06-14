@@ -391,6 +391,11 @@ Properties of the set:
 - **Justified per module.** Every permission carries the runbook module(s) it serves and a
   one-line justification — there are no "might need it" extras.
 
+This is what an administrator sees at the admin-consent step — the entire requested set is
+read-only:
+
+![The Microsoft admin-consent dialog — every requested permission is read-only.](docs/images/consent-dialog-permissions.png)
+
 The GUID-accurate, row-for-row reference — what each permission is for and which discovery
 module uses it — is
 [`manifests/permissions-companion.md`](manifests/permissions-companion.md) (mirrors

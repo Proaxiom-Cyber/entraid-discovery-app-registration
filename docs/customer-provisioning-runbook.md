@@ -261,6 +261,20 @@ Review the consent screen and approve. After approval, Microsoft redirects to th
 consent landing page. That page is only a completion experience; Stage 4 verification remains
 the source of truth for whether all 53 permissions landed.
 
+### What it looks like
+
+After signing in, the administrator reviews the requested permissions and accepts; the
+browser then lands on a confirmation page:
+
+![Microsoft admin-consent dialog listing the requested permissions, with Cancel and Accept buttons. Every permission in the list begins with "Read".](images/consent-dialog-permissions.png)
+
+*The administrator reviews the read-only Microsoft Graph permissions and clicks Accept. Every
+entry in the list is a `Read…` permission — there is nothing to write, change, or invoke.*
+
+![Browser confirmation page reading "Admin consent request completed", showing the tenant and state values.](images/consent-redirect-landing.png)
+
+*After consent, the browser lands on the confirmation page (when `-ConsentRedirectUri` is used).*
+
 ### What the admin is approving
 
 Before approving, the admin can review the full permission list. **All 53 permissions are
