@@ -1,0 +1,13 @@
+{
+  "tenant_id": "REPLACE_WITH_CUSTOMER_TENANT_GUID",
+  "display_name": "Customer assessment - unique engagement reference",
+  "output_directory": "./setup-output",
+  "permission_profile": "REPLACE_WITH_PATH_TO_REVIEWED_PROFILE_JSON",
+  "certificates": [
+    {
+      "path": "./assessment.cer",
+      "sha256": "REPLACE_WITH_PUBLIC_CERTIFICATE_SHA256"
+    }
+  ],
+  "engagement_reference": "REPLACE_WITH_NONSECRET_REFERENCE"
+}

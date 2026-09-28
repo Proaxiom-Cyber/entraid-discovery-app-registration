@@ -1,0 +1,74 @@
+name: Certificate assessment setup
+
+"on":
+  push:
+    paths:
+      - certificate-assessment/**
+      - .github/workflows/certificate-assessment.yml
+  pull_request:
+    paths:
+      - certificate-assessment/**
+      - .github/workflows/certificate-assessment.yml
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  setup:
+    name: Mocked setup and launchers (${{ matrix.os }})
+    runs-on: ${{ matrix.os }}
+    timeout-minutes: 15
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest, windows-latest, macos-latest]
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          persist-credentials: false
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+      - name: Install launcher test dependency
+        run: python -m pip install 'pytest>=8,<10'
+      - name: Test shared PowerShell engine with mocked Graph
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = 'Stop'
+          & ./certificate-assessment/tests/Test-AssessmentApp.ps1
+      - name: Test both launchers without authentication
+        run: python -m pytest -q certificate-assessment/tests/test_launchers.py
+
+  certificate:
+    name: Certificate helper (${{ matrix.os }})
+    runs-on: ${{ matrix.os }}
+    timeout-minutes: 15
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest, macos-latest]
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          persist-credentials: false
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+      - name: Install certificate test dependencies
+        run: python -m pip install -r certificate-assessment/macos/requirements.txt 'pytest>=8,<10'
+      - name: Check for a usable login Keychain
+        if: runner.os == 'macOS'
+        id: keychain
+        shell: bash
+        run: |
+          if test -f "$HOME/Library/Keychains/login.keychain-db" && \
+             security show-keychain-info "$HOME/Library/Keychains/login.keychain-db" >/dev/null 2>&1; then
+            echo 'available=true' >> "$GITHUB_OUTPUT"
+          else
+            echo 'available=false' >> "$GITHUB_OUTPUT"
+            echo '::notice::Native certificate tests skipped: no available login Keychain on this runner.'
+          fi
+      - name: Run certificate tests (native tests skip on Linux)
+        if: runner.os != 'macOS' || steps.keychain.outputs.available == 'true'
+        run: python -m pytest -q certificate-assessment/macos/test_mac_certificate.py

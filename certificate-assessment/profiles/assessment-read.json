@@ -1,0 +1,73 @@
+{
+  "schema_version": 1,
+  "application_permissions": [
+    {
+      "name": "Directory.Read.All",
+      "purpose": "Users, groups, devices, applications, owners, domains and subscribed licences."
+    },
+    {
+      "name": "Policy.Read.All",
+      "purpose": "Conditional Access, security defaults, authentication and cross-tenant policy."
+    },
+    {
+      "name": "UserAuthenticationMethod.Read.All",
+      "purpose": "Registered authentication method types and validity context. The collector must exclude unneeded personal fields."
+    },
+    {
+      "name": "AuditLog.Read.All",
+      "purpose": "Available sign-in and audit records, authentication registration reports."
+    },
+    {
+      "name": "Member.Read.Hidden",
+      "purpose": "Membership of hidden groups that affect policy targeting."
+    },
+    {
+      "name": "RoleManagement.Read.Directory",
+      "purpose": "Active and eligible directory roles and directory role policies."
+    },
+    {
+      "name": "IdentityRiskyUser.Read.All",
+      "purpose": "Identity Protection user-risk context where licensed and available."
+    },
+    {
+      "name": "DeviceManagementConfiguration.Read.All",
+      "purpose": "Intune configuration, compliance and assignment data."
+    },
+    {
+      "name": "DeviceManagementManagedDevices.Read.All",
+      "purpose": "Managed device inventory and reported compliance state."
+    },
+    {
+      "name": "CustomSecAttributeDefinition.Read.All",
+      "purpose": "Definitions used by Conditional Access application filters."
+    },
+    {
+      "name": "CustomSecAttributeAssignment.Read.All",
+      "purpose": "Attribute values used by Conditional Access application filters."
+    },
+    {
+      "name": "CrossTenantInformation.ReadBasic.All",
+      "purpose": "Basic partner-tenant information for external-user policy modelling."
+    },
+    {
+      "name": "DeviceManagementApps.Read.All",
+      "purpose": "Managed applications, deployment assignments and app configuration."
+    },
+    {
+      "name": "DeviceManagementRBAC.Read.All",
+      "purpose": "Intune administrative roles and scope assignments."
+    },
+    {
+      "name": "DeviceManagementServiceConfig.Read.All",
+      "purpose": "Intune enrolment and service configuration."
+    },
+    {
+      "name": "SecurityEvents.Read.All",
+      "purpose": "Microsoft Secure Score and control profiles; collection restricted to those endpoints."
+    },
+    {
+      "name": "Domain-InternalFederation.Read.All",
+      "purpose": "Federated domain settings, including federated identity provider MFA behaviour."
+    }
+  ]
+}

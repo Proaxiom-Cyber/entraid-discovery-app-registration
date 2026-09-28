@@ -1,0 +1,16 @@
+# Local environments and test output.
+.venv/
+__pycache__/
+.pytest_cache/
+.ruff_cache/
+
+# Generated credentials and public setup packs do not belong in this repository.
+*.cer
+*.pem
+*.key
+*.pfx
+*.p12
+certificate-metadata.json
+public-certificate/
+keychain-signer
+keychain-signer.build.json
