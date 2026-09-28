@@ -1,20 +1,19 @@
 # entraid-discovery-app
 
-Provision a **least-privilege, TPM-bound Microsoft Entra ID app registration** for the
-Phase 1 discovery stage of an Entra ID security assessment.
+Set up a Microsoft Entra assessment application with a public certificate and an
+agreed set of read permissions. Choose the setup path for your engagement:
 
-Where a general-purpose "everything an Entra/M365 audit might ever need" app registration is
-deliberately broad, **this app registration is deliberately narrow**: it carries only the
-read permissions the Phase 1 discovery runbook actually uses, and — by default — it
-authenticates with a **certificate whose private key is sealed in a TPM** rather than a
-client secret, so the credential is bound to a single, customer-controlled Windows 11
-endpoint. Engagements that cannot meet that bar can select a weaker credential pathway via
-`-CredentialMode` — always as an explicit, disclosed opt-in, never a silent fallback (see
-[Credential pathways](#credential-pathways)).
+| Path | Setup and key protection |
+|---|---|
+| **[Certificate assessment setup](certificate-assessment/README.md)** | Shell and PowerShell entrypoints share a PowerShell 7 engine on Windows, Linux and macOS. Supports 12- or 17-permission profiles and additive certificate updates. The optional Mac key is software-protected in Keychain; it is not TPM- or Secure Enclave-backed. |
+| [Existing Windows provisioning workflow](docs/customer-provisioning-runbook.md) | The existing 53-permission discovery flow defaults to a non-exportable TPM key on a customer-controlled Windows endpoint. Its explicit alternative credential modes remain available. |
 
-> **New to the tool?** Start with the
-> [customer provisioning runbook](docs/customer-provisioning-runbook.md) — a step-by-step,
-> portal-consent walkthrough from key generation to a working token.
+For the new setup path, download a reviewed release or pinned public revision,
+receive the engagement's public certificate separately, then follow its local
+plan, online preview and apply steps.
+
+The remaining sections on this page describe the **existing Windows provisioning
+workflow**. Its TPM and permission-count statements apply to that workflow.
 
 ---
 
